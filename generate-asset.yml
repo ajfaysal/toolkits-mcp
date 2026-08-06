@@ -1,0 +1,110 @@
+name: Generate Asset
+
+on:
+  workflow_dispatch:
+    inputs:
+      options:
+        description: "JSON string with asset_type, description, style, colors, quantity, job_id, extra_options"
+        required: true
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Parse options
+        id: parse
+        run: |
+          echo '${{ github.event.inputs.options }}' > options.json
+          echo "asset_type=$(jq -r '.asset_type' options.json)" >> "$GITHUB_OUTPUT"
+          echo "description=$(jq -r '.description' options.json)" >> "$GITHUB_OUTPUT"
+          echo "style=$(jq -r '.style // "line"' options.json)" >> "$GITHUB_OUTPUT"
+          echo "colors=$(jq -c '.colors // []' options.json)" >> "$GITHUB_OUTPUT"
+          echo "job_id=$(jq -r '.job_id' options.json)" >> "$GITHUB_OUTPUT"
+          echo "extra_options=$(jq -c '.extra_options // {}' options.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Register run_id for status polling
+        env:
+          JOB_ID: ${{ steps.parse.outputs.job_id }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "$RUN_ID" > run_id.txt
+          pip install boto3 --quiet
+          python3 - <<'PYEOF'
+          import os, boto3
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=f"https://{os.environ['CF_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+              aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+              aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+          )
+          job_id = os.environ["JOB_ID"]
+          s3.upload_file("run_id.txt", "toolkits-assets", f"jobs/{job_id}/run_id.txt")
+          print("Registered run_id for job", job_id)
+          PYEOF
+        env:
+          JOB_ID: ${{ steps.parse.outputs.job_id }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: Set up Python
+        if: steps.parse.outputs.asset_type == 'icon'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate icon SVG
+        if: steps.parse.outputs.asset_type == 'icon'
+        run: |
+          python3 generators/icon/generate.py \
+            --description "${{ steps.parse.outputs.description }}" \
+            --style "${{ steps.parse.outputs.style }}" \
+            --colors '${{ steps.parse.outputs.colors }}' \
+            --job_id "${{ steps.parse.outputs.job_id }}" \
+            --extra_options '${{ steps.parse.outputs.extra_options }}'
+
+      - name: Install Inkscape
+        if: steps.parse.outputs.asset_type == 'icon'
+        run: sudo apt-get update && sudo apt-get install -y inkscape
+
+      - name: Convert SVG to EPS
+        if: steps.parse.outputs.asset_type == 'icon'
+        run: |
+          chmod +x generators/icon/svg_to_eps.sh
+          ./generators/icon/svg_to_eps.sh "${{ steps.parse.outputs.job_id }}"
+
+      - name: Fail on unsupported asset_type
+        if: steps.parse.outputs.asset_type != 'icon'
+        run: |
+          echo "ERROR: unsupported asset_type '${{ steps.parse.outputs.asset_type }}'. Add a generators/<type>/ folder to support it." >&2
+          exit 1
+
+      - name: Upload output files to R2
+        env:
+          JOB_ID: ${{ steps.parse.outputs.job_id }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          pip install boto3 --quiet
+          python3 - <<'PYEOF'
+          import os, boto3, glob
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=f"https://{os.environ['CF_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+              aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+              aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+          )
+          job_id = os.environ["JOB_ID"]
+          folder = f"output/{job_id}"
+          files = glob.glob(f"{folder}/*")
+          if not files:
+              raise SystemExit(f"ERROR: no output files found in {folder}")
+          for f in files:
+              key = f"jobs/{job_id}/{os.path.basename(f)}"
+              s3.upload_file(f, "toolkits-assets", key)
+              print("Uploaded", key)
+          PYEOF
