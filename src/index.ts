@@ -147,6 +147,328 @@ async function handleToolCall(env: Env, name: string, args: any) {
   }
 }
 
+const LANDING_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>toolkits.app — MCP Forge</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  :root{
+    --ink:#121319;
+    --panel:#1B1D24;
+    --panel-2:#20232B;
+    --steel:#383C47;
+    --paper:#EAE7DF;
+    --paper-dim:#9A9C9C;
+    --ember:#E8823C;
+    --ember-dim:#8A5227;
+    --signal:#6FE7C8;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html{scroll-behavior:smooth;}
+  body{
+    background:var(--ink);
+    color:var(--paper);
+    font-family:'Inter', sans-serif;
+    line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+  .mono{font-family:'JetBrains Mono', monospace;}
+  .display{font-family:'Space Grotesk', sans-serif;}
+
+  a{color:inherit;}
+
+  .wrap{
+    max-width:920px;
+    margin:0 auto;
+    padding:0 24px;
+  }
+
+  /* ---- top bar ---- */
+  header{
+    padding:28px 0 0;
+  }
+  .topbar{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+  }
+  .brand{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    font-family:'Space Grotesk', sans-serif;
+    font-weight:700;
+    font-size:15px;
+    letter-spacing:0.02em;
+  }
+  .brand-mark{
+    width:9px; height:9px;
+    background:var(--ember);
+    border-radius:2px;
+    transform:rotate(45deg);
+    flex:none;
+  }
+  .status-pill{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    font-family:'JetBrains Mono', monospace;
+    font-size:12px;
+    color:var(--signal);
+    border:1px solid var(--steel);
+    padding:6px 12px;
+    border-radius:100px;
+  }
+  .dot{
+    width:6px; height:6px;
+    border-radius:50%;
+    background:var(--signal);
+    box-shadow:0 0 0 0 rgba(111,231,200,0.6);
+    animation:pulse 2.4s ease-out infinite;
+  }
+  @keyframes pulse{
+    0%{ box-shadow:0 0 0 0 rgba(111,231,200,0.45); }
+    70%{ box-shadow:0 0 0 8px rgba(111,231,200,0); }
+    100%{ box-shadow:0 0 0 0 rgba(111,231,200,0); }
+  }
+
+  /* ---- hero ---- */
+  .hero{
+    padding:96px 0 56px;
+  }
+  .eyebrow{
+    font-family:'JetBrains Mono', monospace;
+    font-size:12px;
+    letter-spacing:0.14em;
+    text-transform:uppercase;
+    color:var(--ember);
+    margin-bottom:18px;
+  }
+  h1{
+    font-family:'Space Grotesk', sans-serif;
+    font-weight:700;
+    font-size:clamp(34px, 6vw, 56px);
+    line-height:1.05;
+    letter-spacing:-0.01em;
+    max-width:11ch;
+  }
+  .hero-sub{
+    margin-top:20px;
+    max-width:46ch;
+    color:var(--paper-dim);
+    font-size:16px;
+  }
+
+  /* ---- signal line, the signature element ---- */
+  .signal-line{
+    margin:44px 0 8px;
+    height:64px;
+    position:relative;
+    overflow:hidden;
+    border-top:1px solid var(--steel);
+    border-bottom:1px solid var(--steel);
+  }
+  .signal-line svg{ display:block; width:200%; height:100%; }
+  .signal-path{
+    stroke:var(--signal);
+    stroke-width:1.6;
+    fill:none;
+    animation:travel 7s linear infinite;
+  }
+  @keyframes travel{
+    from{ transform:translateX(0); }
+    to{ transform:translateX(-50%); }
+  }
+  @media (prefers-reduced-motion: reduce){
+    .signal-path{ animation:none; }
+    .dot{ animation:none; }
+  }
+  .signal-caption{
+    display:flex;
+    justify-content:space-between;
+    font-family:'JetBrains Mono', monospace;
+    font-size:11px;
+    color:var(--paper-dim);
+    margin-top:8px;
+  }
+
+  /* ---- endpoint block ---- */
+  .endpoint{
+    margin-top:56px;
+    background:var(--panel);
+    border:1px solid var(--steel);
+    border-radius:10px;
+    overflow:hidden;
+  }
+  .endpoint-head{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    padding:12px 18px;
+    border-bottom:1px solid var(--steel);
+    font-family:'JetBrains Mono', monospace;
+    font-size:11px;
+    color:var(--paper-dim);
+    letter-spacing:0.06em;
+    text-transform:uppercase;
+  }
+  .endpoint-body{
+    padding:20px 18px 22px;
+    font-family:'JetBrains Mono', monospace;
+    font-size:14px;
+    overflow-x:auto;
+  }
+  .endpoint-body .k{ color:var(--paper-dim); }
+  .endpoint-body .v{ color:var(--signal); }
+  .endpoint-body pre{ white-space:pre-wrap; word-break:break-word; }
+
+  /* ---- tools section ---- */
+  .section-label{
+    font-family:'JetBrains Mono', monospace;
+    font-size:12px;
+    letter-spacing:0.12em;
+    text-transform:uppercase;
+    color:var(--paper-dim);
+    margin:80px 0 22px;
+    display:flex;
+    align-items:center;
+    gap:12px;
+  }
+  .section-label::after{
+    content:"";
+    flex:1;
+    height:1px;
+    background:var(--steel);
+  }
+
+  .tools{
+    display:grid;
+    grid-template-columns:1fr;
+    gap:14px;
+  }
+  @media (min-width:640px){
+    .tools{ grid-template-columns:1fr 1fr; }
+  }
+  .tool-card{
+    background:var(--panel);
+    border:1px solid var(--steel);
+    border-radius:10px;
+    padding:20px;
+    position:relative;
+    transition:border-color .2s ease, transform .2s ease;
+  }
+  .tool-card:hover{
+    border-color:var(--ember-dim);
+    transform:translateY(-2px);
+  }
+  .tool-index{
+    font-family:'JetBrains Mono', monospace;
+    font-size:11px;
+    color:var(--ember);
+  }
+  .tool-name{
+    font-family:'Space Grotesk', sans-serif;
+    font-weight:700;
+    font-size:18px;
+    margin:10px 0 8px;
+  }
+  .tool-desc{
+    font-size:13.5px;
+    color:var(--paper-dim);
+  }
+  .tool-card.wide{ grid-column:1 / -1; }
+
+  /* ---- footer ---- */
+  footer{
+    margin-top:100px;
+    padding:28px 0 48px;
+    border-top:1px solid var(--steel);
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    font-family:'JetBrains Mono', monospace;
+    font-size:11px;
+    color:var(--paper-dim);
+    flex-wrap:wrap;
+    gap:10px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap topbar">
+    <div class="brand"><span class="brand-mark"></span>toolkits.app</div>
+    <div class="status-pill"><span class="dot"></span>server online</div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="hero">
+    <div class="eyebrow">MCP endpoint</div>
+    <h1>The forge behind your stock assets.</h1>
+    <p class="hero-sub">
+      A remote control panel Claude connects to directly — describe an icon, it comes
+      back as a finished, Adobe-Stock-ready file. No manual export, no local software.
+    </p>
+
+    <div class="signal-line" aria-hidden="true">
+      <svg viewBox="0 0 800 64" preserveAspectRatio="none">
+        <path class="signal-path" d="M0,32 L120,32 L136,10 L152,54 L168,32 L280,32 L296,18 L312,46 L328,32 L800,32
+                                      L920,32 L936,10 L952,54 L968,32 L1080,32 L1096,18 L1112,46 L1128,32 L1600,32" />
+      </svg>
+    </div>
+    <div class="signal-caption">
+      <span>request → generate → convert → deliver</span>
+      <span>~30–60s per job</span>
+    </div>
+
+    <div class="endpoint">
+      <div class="endpoint-head">
+        <span>connection</span>
+        <span>Streamable HTTP</span>
+      </div>
+      <div class="endpoint-body">
+        <pre><span class="k">POST</span> <span class="v">https://mcp.toolkits.app/mcp</span>
+<span class="k">Authorization:</span> Bearer &lt;token&gt;
+<span class="k">Content-Type:</span> application/json</pre>
+      </div>
+    </div>
+  </section>
+
+  <div class="section-label">available tools</div>
+  <div class="tools">
+    <div class="tool-card">
+      <div class="tool-index">01</div>
+      <div class="tool-name">generate_asset</div>
+      <div class="tool-desc">Starts a job — description, style, and colors in, a job_id back out.</div>
+    </div>
+    <div class="tool-card">
+      <div class="tool-index">02</div>
+      <div class="tool-name">check_status</div>
+      <div class="tool-desc">Polls a running job until it's queued, in progress, or complete.</div>
+    </div>
+    <div class="tool-card wide">
+      <div class="tool-index">03</div>
+      <div class="tool-name">get_files</div>
+      <div class="tool-desc">Returns download links for every finished file — SVG source and print-ready EPS.</div>
+    </div>
+  </div>
+
+  <footer>
+    <span>toolkits.app / mcp</span>
+    <span>build via Cloudflare Workers + GitHub Actions</span>
+  </footer>
+</main>
+
+</body>
+</html>
+`;
+
 function jsonRpcResult(id: any, result: any) {
   return { jsonrpc: "2.0", id, result };
 }
@@ -157,6 +479,12 @@ function jsonRpcError(id: any, code: number, message: string) {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+
+    if (request.method === "GET" && url.pathname === "/") {
+      return new Response(LANDING_HTML, {
+        headers: { "Content-Type": "text/html; charset=UTF-8" },
+      });
+    }
 
     if (url.pathname !== "/mcp") {
       return new Response("Not found", { status: 404 });
