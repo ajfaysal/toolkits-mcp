@@ -476,6 +476,32 @@ function jsonRpcError(id: any, code: number, message: string) {
   return { jsonrpc: "2.0", id, error: { code, message } };
 }
 
+function corsHeaders(request: Request, extraHeaders: HeadersInit = {}) {
+  const headers = new Headers(extraHeaders);
+  const origin = request.headers.get("Origin");
+
+  headers.set("Access-Control-Allow-Origin", origin ?? "*");
+  headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  headers.set(
+    "Access-Control-Allow-Headers",
+    "Authorization, Content-Type, Accept, MCP-Protocol-Version, MCP-Session-Id, Last-Event-ID"
+  );
+  headers.set("Access-Control-Max-Age", "86400");
+
+  if (origin) {
+    headers.append("Vary", "Origin");
+  }
+
+  return headers;
+}
+
+function jsonResponse(request: Request, body: unknown, init: ResponseInit = {}) {
+  return Response.json(body, {
+    ...init,
+    headers: corsHeaders(request, init.headers),
+  });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -490,31 +516,59 @@ export default {
       return new Response("Not found", { status: 404 });
     }
 
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders(request),
+      });
+    }
+
+    if (request.method === "GET") {
+      return new Response("Method not allowed", {
+        status: 405,
+        headers: corsHeaders(request, { Allow: "POST, OPTIONS" }),
+      });
+    }
+
     // Auth check: accept either Authorization header (Claude) or ?token= query param (ChatGPT)
     const auth = request.headers.get("Authorization") || "";
     const queryToken = url.searchParams.get("token") || "";
     const headerOk = auth === `Bearer ${env.MCP_AUTH_TOKEN}`;
     const queryOk = queryToken === env.MCP_AUTH_TOKEN;
     if (!headerOk && !queryOk) {
-      return new Response("Unauthorized", { status: 401 });
+      return new Response("Unauthorized", {
+        status: 401,
+        headers: corsHeaders(request, { "WWW-Authenticate": 'Bearer realm="toolkits-mcp"' }),
+      });
     }
 
     if (request.method !== "POST") {
-      return new Response("Method not allowed", { status: 405 });
+      return new Response("Method not allowed", {
+        status: 405,
+        headers: corsHeaders(request, { Allow: "POST, OPTIONS" }),
+      });
     }
 
     let body: any;
     try {
       body = await request.json();
     } catch {
-      return Response.json(jsonRpcError(null, -32700, "Parse error"), { status: 400 });
+      return jsonResponse(request, jsonRpcError(null, -32700, "Parse error"), { status: 400 });
     }
 
     const { id, method, params } = body;
 
     try {
+      if (method === "notifications/initialized" || id === undefined || id === null) {
+        return new Response(null, {
+          status: 202,
+          headers: corsHeaders(request),
+        });
+      }
+
       if (method === "initialize") {
-        return Response.json(
+        return jsonResponse(
+          request,
           jsonRpcResult(id, {
             protocolVersion: "2025-06-18",
             capabilities: { tools: {} },
@@ -524,22 +578,27 @@ export default {
       }
 
       if (method === "tools/list") {
-        return Response.json(jsonRpcResult(id, { tools: TOOLS }));
+        return jsonResponse(request, jsonRpcResult(id, { tools: TOOLS }));
       }
 
       if (method === "tools/call") {
         const { name, arguments: args } = params;
         const result = await handleToolCall(env, name, args);
-        return Response.json(
+        return jsonResponse(
+          request,
           jsonRpcResult(id, {
             content: [{ type: "text", text: JSON.stringify(result) }],
           })
         );
       }
 
-      return Response.json(jsonRpcError(id, -32601, `Method not found: ${method}`), { status: 400 });
+      return jsonResponse(request, jsonRpcError(id, -32601, `Method not found: ${method}`), {
+        status: 400,
+      });
     } catch (err: any) {
-      return Response.json(jsonRpcError(id, -32000, err.message || "Internal error"), { status: 500 });
+      return jsonResponse(request, jsonRpcError(id, -32000, err.message || "Internal error"), {
+        status: 500,
+      });
     }
   },
 };
