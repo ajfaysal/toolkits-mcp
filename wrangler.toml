@@ -7,9 +7,9 @@ binding = "ASSETS"
 bucket_name = "toolkits-assets"
 
 [vars]
-GITHUB_OWNER = "YOUR_GITHUB_USERNAME"
+GITHUB_OWNER = "ajfaysal"
 GITHUB_REPO = "toolkits-mcp"
-ASSETS_PUBLIC_BASE_URL = "https://REPLACE_WITH_YOUR_R2_PUBLIC_URL"
+ASSETS_PUBLIC_BASE_URL = "https://https://pub-754afb105d4d4297ae849b868850f2da.r2.dev"
 
 # Secrets (MCP_AUTH_TOKEN, GITHUB_PAT) are NOT set here.
 # Add them via: Cloudflare Dashboard → Worker → Settings → Variables and Secrets
