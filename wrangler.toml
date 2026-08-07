@@ -15,6 +15,3 @@ ASSETS_PUBLIC_BASE_URL = "https://https://pub-754afb105d4d4297ae849b868850f2da.r
 # Add them via: Cloudflare Dashboard → Worker → Settings → Variables and Secrets
 # or via CLI: wrangler secret put MCP_AUTH_TOKEN
 
-[[routes]]
-pattern = "mcp.toolkits.app"
-custom_domain = true
