@@ -490,9 +490,12 @@ export default {
       return new Response("Not found", { status: 404 });
     }
 
-    // Auth check
+    // Auth check: accept either Authorization header (Claude) or ?token= query param (ChatGPT)
     const auth = request.headers.get("Authorization") || "";
-    if (auth !== `Bearer ${env.MCP_AUTH_TOKEN}`) {
+    const queryToken = url.searchParams.get("token") || "";
+    const headerOk = auth === `Bearer ${env.MCP_AUTH_TOKEN}`;
+    const queryOk = queryToken === env.MCP_AUTH_TOKEN;
+    if (!headerOk && !queryOk) {
       return new Response("Unauthorized", { status: 401 });
     }
 
