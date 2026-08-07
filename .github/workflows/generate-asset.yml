@@ -29,6 +29,9 @@ jobs:
         env:
           JOB_ID: ${{ steps.parse.outputs.job_id }}
           RUN_ID: ${{ github.run_id }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           echo "$RUN_ID" > run_id.txt
           pip install boto3 --quiet
@@ -44,11 +47,6 @@ jobs:
           s3.upload_file("run_id.txt", "toolkits-assets", f"jobs/{job_id}/run_id.txt")
           print("Registered run_id for job", job_id)
           PYEOF
-        env:
-          JOB_ID: ${{ steps.parse.outputs.job_id }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 
       - name: Set up Python
         if: steps.parse.outputs.asset_type == 'icon'
