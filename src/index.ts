@@ -45,6 +45,29 @@ const TOOLS = [
     },
   },
   {
+    name: "convert_image_to_vector",
+    description:
+      "Converts an uploaded raster image (PNG/JPG) into a clean vector file (SVG + EPS) using edge tracing. Best for logos, simple illustrations, and icon-style source images. Returns a job_id; use check_status then get_files as usual.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        image_base64: {
+          type: "string",
+          description: "Base64-encoded PNG or JPG image data (no data: prefix, just the raw base64).",
+        },
+        image_format: {
+          type: "string",
+          description: "Format of the source image: 'png' or 'jpg'/'jpeg'.",
+        },
+        style: {
+          type: "string",
+          description: "Optional style hint, e.g. 'flat', 'line', 'detailed' -- passed to vtracer tuning",
+        },
+      },
+      required: ["image_base64", "image_format"],
+    },
+  },
+  {
     name: "check_status",
     description: "Check the status of a previously started generate_asset job.",
     inputSchema: {
@@ -64,9 +87,9 @@ const TOOLS = [
   },
 ];
 
-async function githubDispatch(env: Env, inputs: Record<string, unknown>) {
+async function githubDispatch(env: Env, inputs: Record<string, unknown>, existingJobId?: string) {
   const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/actions/workflows/generate-asset.yml/dispatches`;
-  const jobId = crypto.randomUUID();
+  const jobId = existingJobId ?? crypto.randomUUID();
   const body = {
     ref: "main",
     inputs: {
@@ -129,11 +152,51 @@ async function getFiles(env: Env, jobId: string) {
   return files;
 }
 
+async function convertImageToVector(env: Env, args: any) {
+  const { image_base64, image_format, style } = args;
+  if (!image_base64 || !image_format) {
+    throw new Error("image_base64 and image_format are required");
+  }
+
+  const jobId = crypto.randomUUID();
+
+  // Decode base64 -> bytes (Workers runtime has global atob)
+  const binaryString = atob(image_base64);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+
+  const MAX_BYTES = 8_000_000; // 8MB
+  if (bytes.length > MAX_BYTES) {
+    throw new Error("Image too large (max 8MB), please compress or resize it first.");
+  }
+
+  const ext = image_format === "jpg" || image_format === "jpeg" ? "jpg" : "png";
+  await env.ASSETS.put(`jobs/${jobId}/source.${ext}`, bytes);
+
+  await githubDispatch(
+    env,
+    {
+      asset_type: "vector_trace",
+      job_id: jobId,
+      image_format: ext,
+      style: style || "flat",
+    },
+    jobId
+  );
+
+  return { job_id: jobId, status: "queued" };
+}
+
 async function handleToolCall(env: Env, name: string, args: any) {
   switch (name) {
     case "generate_asset": {
       const jobId = await githubDispatch(env, args);
       return { job_id: jobId, status: "queued" };
+    }
+    case "convert_image_to_vector": {
+      return await convertImageToVector(env, args);
     }
     case "check_status": {
       return await checkStatus(env, args.job_id);
@@ -452,10 +515,15 @@ const LANDING_HTML = `<!doctype html>
       <div class="tool-name">check_status</div>
       <div class="tool-desc">Polls a running job until it's queued, in progress, or complete.</div>
     </div>
-    <div class="tool-card wide">
+    <div class="tool-card">
       <div class="tool-index">03</div>
       <div class="tool-name">get_files</div>
       <div class="tool-desc">Returns download links for every finished file — SVG source and print-ready EPS.</div>
+    </div>
+    <div class="tool-card">
+      <div class="tool-index">04</div>
+      <div class="tool-name">convert_image_to_vector</div>
+      <div class="tool-desc">Converts an uploaded PNG/JPG image into clean SVG and EPS vector files.</div>
     </div>
   </div>
 
