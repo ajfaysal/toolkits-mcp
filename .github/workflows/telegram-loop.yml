@@ -56,20 +56,7 @@ jobs:
 
           build_audio_full () {
             local src="$1" out="$2"
-            local C=3
-            local D=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$src")
-            local long_enough=$(python3 -c "print(1 if $D >= $DURATION_SEC else 0)")
-            if [ "$long_enough" = "1" ]; then
-              ffmpeg -y -i "$src" -t $DURATION_SEC -af "volume=1.0001" -map_metadata -1 -metadata title="$UNIQUE_TITLE" -acodec libmp3lame -b:a 192k "$out"
-            else
-              local BODY=$(python3 -c "print($D - 2*$C)")
-              ffmpeg -y -sseof -$C -i "$src" -t $C work/a_tail.mp3
-              ffmpeg -y -ss 0 -t $C -i "$src" work/a_head.mp3
-              ffmpeg -y -i work/a_tail.mp3 -i work/a_head.mp3 -filter_complex "acrossfade=d=$C:c1=tri:c2=tri" work/a_blended.mp3
-              ffmpeg -y -ss $C -t $BODY -i "$src" work/a_body.mp3
-              ffmpeg -y -i work/a_blended.mp3 -i work/a_body.mp3 -filter_complex "[0:a][1:a]concat=n=2:v=0:a=1[out]" -map "[out]" -acodec libmp3lame -q:a 2 work/a_loop_unit.mp3
-              ffmpeg -y -stream_loop -1 -i work/a_loop_unit.mp3 -t $DURATION_SEC -af "volume=1.0001" -map_metadata -1 -metadata title="$UNIQUE_TITLE" -acodec libmp3lame -b:a 192k "$out"
-            fi
+            ffmpeg -y -stream_loop -1 -i "$src" -t $DURATION_SEC -af "volume=1.0001" -map_metadata -1 -metadata title="$UNIQUE_TITLE" -acodec libmp3lame -b:a 192k "$out"
           }
 
           if [ "$IS_VIDEO" = "true" ]; then
