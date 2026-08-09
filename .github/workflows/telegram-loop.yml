@@ -30,7 +30,7 @@ jobs:
             if [ -n \"\$input_key\" ]; then
               aws s3 cp \"s3://toolkits-assets/\$input_key\" \"\$outfile\" --endpoint-url \"$R2_ENDPOINT\"
             elif [ -n \"\$drive_id\" ]; then
-              gdown --id \"\$drive_id\" -O \"\$outfile\"
+              gdown \"\$drive_id\" -O \"\$outfile\"
             fi
           }" > work/download_source.sh
 
