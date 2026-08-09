@@ -82,15 +82,17 @@ jobs:
             C=1.5
             D=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 work/source_video)
             BODY=$(python3 -c "print($D - 2*$C)")
-            ffmpeg -y -sseof -$C -i work/source_video -t $C -an -c:v libx264 -crf 14 -preset slow work/tail.mp4
-            ffmpeg -y -ss 0 -t $C -i work/source_video -an -c:v libx264 -crf 14 -preset slow work/head.mp4
+            
+            # নিখুঁত জোড়া লাগানো (Seamless Crossfade) ফাস্ট প্রিসেটের মাধ্যমে
+            ffmpeg -y -sseof -$C -i work/source_video -t $C -an -c:v libx264 -crf 14 -preset fast work/tail.mp4
+            ffmpeg -y -ss 0 -t $C -i work/source_video -an -c:v libx264 -crf 14 -preset fast work/head.mp4
             ffmpeg -y -i work/tail.mp4 -i work/head.mp4 -filter_complex \
               "[0:v][1:v]xfade=transition=fade:duration=$C:offset=0[v]" -map "[v]" \
-              -c:v libx264 -crf 14 -preset slow work/blended.mp4
-            ffmpeg -y -ss $C -t $BODY -i work/source_video -an -c:v libx264 -crf 14 -preset slow work/body.mp4
+              -c:v libx264 -crf 14 -preset fast work/blended.mp4
+            ffmpeg -y -ss $C -t $BODY -i work/source_video -an -c:v libx264 -crf 14 -preset fast work/body.mp4
             ffmpeg -y -i work/blended.mp4 -i work/body.mp4 -filter_complex \
               "[0:v][1:v]concat=n=2:v=1:a=0[v]" -map "[v]" \
-              -c:v libx264 -crf 14 -preset slow -g 30 work/loop_unit.mp4
+              -c:v libx264 -crf 14 -preset fast -g 30 work/loop_unit.mp4
 
             OUTPUT_KEY="telegram-outputs/${CHAT_ID}-${TIMESTAMP}.mp4"
 
@@ -98,16 +100,17 @@ jobs:
               download_source "$AUDIO_INPUT_KEY" "$AUDIO_DRIVE_ID" work/source_audio
               build_audio_full work/source_audio work/audio_full.mp3
 
+              # ফাইনাল রেন্ডার: মাইক্রো-ফিল্টার + ফাস্ট স্পিড = ১০০% ইউনিক পিক্সেল ও নিরাপদ রেন্ডারিং
               ffmpeg -y -stream_loop -1 -i work/loop_unit.mp4 -i work/audio_full.mp3 -t $DURATION_SEC \
                 -vf "eq=brightness=0.001:contrast=1.001" \
-                -map 0:v -map 1:a -c:v libx264 -crf 14 -preset slow -c:a aac -b:a 192k \
+                -map 0:v -map 1:a -c:v libx264 -crf 14 -preset fast -c:a copy \
                 -map_metadata -1 -metadata title="$UNIQUE_TITLE" \
                 -movflags +frag_keyframe+empty_moov+default_base_moof -f mp4 pipe:1 | \
               aws s3 cp - "s3://toolkits-assets/${OUTPUT_KEY}" --endpoint-url "$R2_ENDPOINT"
             else
               ffmpeg -y -stream_loop -1 -i work/loop_unit.mp4 -t $DURATION_SEC \
                 -vf "eq=brightness=0.001:contrast=1.001" \
-                -c:v libx264 -crf 14 -preset slow \
+                -c:v libx264 -crf 14 -preset fast \
                 -map_metadata -1 -metadata title="$UNIQUE_TITLE" \
                 -movflags +frag_keyframe+empty_moov+default_base_moof \
                 -f mp4 pipe:1 | \
