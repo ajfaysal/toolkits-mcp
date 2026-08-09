@@ -56,7 +56,7 @@ jobs:
 
           build_audio_full () {
             local src="$1" out="$2"
-            ffmpeg -y -stream_loop -1 -i "$src" -t $DURATION_SEC -af "volume=1.0001" -map_metadata -1 -metadata title="$UNIQUE_TITLE" -acodec libmp3lame -b:a 192k "$out"
+            ffmpeg -y -i "$src" -t $DURATION_SEC -af "volume=1.0001" -map_metadata -1 -metadata title="$UNIQUE_TITLE" -acodec libmp3lame -b:a 192k "$out"
           }
 
           if [ "$IS_VIDEO" = "true" ]; then
