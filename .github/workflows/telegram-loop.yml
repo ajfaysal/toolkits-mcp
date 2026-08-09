@@ -11,8 +11,10 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Install ffmpeg and gdown
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          sudo pip3 install gdown --break-system-packages
 
       - name: Configure R2 (S3-compatible) env
         run: |
@@ -28,13 +30,7 @@ jobs:
             if [ -n \"\$input_key\" ]; then
               aws s3 cp \"s3://toolkits-assets/\$input_key\" \"\$outfile\" --endpoint-url \"$R2_ENDPOINT\"
             elif [ -n \"\$drive_id\" ]; then
-              curl -sc /tmp/cookies \"https://drive.google.com/uc?export=download&id=\$drive_id\" > /tmp/page.html
-              CONFIRM=\$(grep -o 'confirm=[0-9A-Za-z_]*' /tmp/page.html | head -1 | cut -d= -f2)
-              if [ -n \"\$CONFIRM\" ]; then
-                curl -Lb /tmp/cookies \"https://drive.google.com/uc?export=download&confirm=\$CONFIRM&id=\$drive_id\" -o \"\$outfile\"
-              else
-                curl -Lb /tmp/cookies \"https://drive.google.com/uc?export=download&id=\$drive_id\" -o \"\$outfile\"
-              fi
+              gdown --id \"\$drive_id\" -O \"\$outfile\"
             fi
           }" > work/download_source.sh
 
@@ -77,13 +73,12 @@ jobs:
           }
 
           if [ "$IS_VIDEO" = "true" ]; then
-            download_source "$INPUT_KEY" "" work/source_video
+            download_source "$INPUT_KEY" "$DRIVE_ID" work/source_video
 
             C=1.5
             D=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 work/source_video)
             BODY=$(python3 -c "print($D - 2*$C)")
             
-            # নিখুঁত জোড়া লাগানো (Seamless Crossfade) ফাস্ট প্রিসেটের মাধ্যমে
             ffmpeg -y -sseof -$C -i work/source_video -t $C -an -c:v libx264 -crf 14 -preset fast work/tail.mp4
             ffmpeg -y -ss 0 -t $C -i work/source_video -an -c:v libx264 -crf 14 -preset fast work/head.mp4
             ffmpeg -y -i work/tail.mp4 -i work/head.mp4 -filter_complex \
@@ -100,7 +95,6 @@ jobs:
               download_source "$AUDIO_INPUT_KEY" "$AUDIO_DRIVE_ID" work/source_audio
               build_audio_full work/source_audio work/audio_full.mp3
 
-              # ফাইনাল রেন্ডার: মাইক্রো-ফিল্টার + ফাস্ট স্পিড = ১০০% ইউনিক পিক্সেল ও নিরাপদ রেন্ডারিং
               ffmpeg -y -stream_loop -1 -i work/loop_unit.mp4 -i work/audio_full.mp3 -t $DURATION_SEC \
                 -vf "eq=brightness=0.001:contrast=1.001" \
                 -map 0:v -map 1:a -c:v libx264 -crf 14 -preset fast -c:a copy \
