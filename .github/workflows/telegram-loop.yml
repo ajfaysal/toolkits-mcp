@@ -40,6 +40,10 @@ jobs:
 
       - name: Build and stream output
         env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_EC2_METADATA_DISABLED: "true"
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
           IS_VIDEO: ${{ github.event.client_payload.is_video }}
           INPUT_KEY: ${{ github.event.client_payload.input_key }}
           DRIVE_ID: ${{ github.event.client_payload.drive_id }}
@@ -52,6 +56,7 @@ jobs:
           source work/download_source.sh
           DURATION_SEC=$((TARGET_MINUTES * 60))
           TIMESTAMP=$(date +%s)
+          UNIQUE_TITLE="Lofi_Render_${TIMESTAMP}_$(shuf -i 1000-9999 -n 1)"
 
           build_audio_full () {
             local src="$1" out="$2"
@@ -59,7 +64,7 @@ jobs:
             local D=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$src")
             local long_enough=$(python3 -c "print(1 if $D >= $DURATION_SEC else 0)")
             if [ "$long_enough" = "1" ]; then
-              ffmpeg -y -i "$src" -t $DURATION_SEC -acodec libmp3lame -b:a 192k "$out"
+              ffmpeg -y -i "$src" -t $DURATION_SEC -af "volume=1.0001" -map_metadata -1 -metadata title="$UNIQUE_TITLE" -acodec libmp3lame -b:a 192k "$out"
             else
               local BODY=$(python3 -c "print($D - 2*$C)")
               ffmpeg -y -sseof -$C -i "$src" -t $C work/a_tail.mp3
@@ -67,7 +72,7 @@ jobs:
               ffmpeg -y -i work/a_tail.mp3 -i work/a_head.mp3 -filter_complex "acrossfade=d=$C:c1=tri:c2=tri" work/a_blended.mp3
               ffmpeg -y -ss $C -t $BODY -i "$src" work/a_body.mp3
               ffmpeg -y -i work/a_blended.mp3 -i work/a_body.mp3 -filter_complex "[0:a][1:a]concat=n=2:v=0:a=1[out]" -map "[out]" -acodec libmp3lame -q:a 2 work/a_loop_unit.mp3
-              ffmpeg -y -stream_loop -1 -i work/a_loop_unit.mp3 -t $DURATION_SEC -acodec libmp3lame -b:a 192k "$out"
+              ffmpeg -y -stream_loop -1 -i work/a_loop_unit.mp3 -t $DURATION_SEC -af "volume=1.0001" -map_metadata -1 -metadata title="$UNIQUE_TITLE" -acodec libmp3lame -b:a 192k "$out"
             fi
           }
 
@@ -94,12 +99,17 @@ jobs:
               build_audio_full work/source_audio work/audio_full.mp3
 
               ffmpeg -y -stream_loop -1 -i work/loop_unit.mp4 -i work/audio_full.mp3 -t $DURATION_SEC \
-                -map 0:v -map 1:a -c:v copy -c:a aac -b:a 192k \
+                -vf "eq=brightness=0.001:contrast=1.001" \
+                -map 0:v -map 1:a -c:v libx264 -crf 14 -preset slow -c:a aac -b:a 192k \
+                -map_metadata -1 -metadata title="$UNIQUE_TITLE" \
                 -movflags +frag_keyframe+empty_moov+default_base_moof -f mp4 pipe:1 | \
               aws s3 cp - "s3://toolkits-assets/${OUTPUT_KEY}" --endpoint-url "$R2_ENDPOINT"
             else
               ffmpeg -y -stream_loop -1 -i work/loop_unit.mp4 -t $DURATION_SEC \
-                -c copy -movflags +frag_keyframe+empty_moov+default_base_moof \
+                -vf "eq=brightness=0.001:contrast=1.001" \
+                -c:v libx264 -crf 14 -preset slow \
+                -map_metadata -1 -metadata title="$UNIQUE_TITLE" \
+                -movflags +frag_keyframe+empty_moov+default_base_moof \
                 -f mp4 pipe:1 | \
               aws s3 cp - "s3://toolkits-assets/${OUTPUT_KEY}" --endpoint-url "$R2_ENDPOINT"
             fi
@@ -123,7 +133,10 @@ jobs:
             -d text="Done! Your seamless loop is ready: ${DOWNLOAD_URL}"
 
       - name: Clean up R2 source inputs
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
         run: |
           [ -n "${{ github.event.client_payload.input_key }}" ] && aws s3 rm "s3://toolkits-assets/${{ github.event.client_payload.input_key }}" --endpoint-url "$R2_ENDPOINT" || true
           [ -n "${{ github.event.client_payload.audio_input_key }}" ] && aws s3 rm "s3://toolkits-assets/${{ github.event.client_payload.audio_input_key }}" --endpoint-url "$R2_ENDPOINT" || true
-          
