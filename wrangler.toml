@@ -1,17 +1,12 @@
 name = "toolkits-mcp"
 main = "src/index.ts"
-compatibility_date = "2026-08-01"
+compatibility_date = "2024-09-23"
 
 [[r2_buckets]]
-binding = "ASSETS"
+binding = "TOOLKITS_BUCKET"
 bucket_name = "toolkits-assets"
 
 [vars]
 GITHUB_OWNER = "ajfaysal"
 GITHUB_REPO = "toolkits-mcp"
-ASSETS_PUBLIC_BASE_URL = "https://pub-754afb105d4d4297ae849b868850f2da.r2.dev"
-
-# Secrets (MCP_AUTH_TOKEN, GITHUB_PAT) are NOT set here.
-# Add them via: Cloudflare Dashboard → Worker → Settings → Variables and Secrets
-# or via CLI: wrangler secret put MCP_AUTH_TOKEN
-
+R2_PUBLIC_BASE_URL = "https://pub-754afb105d4d4297ae849b868850f2da.r2.dev"

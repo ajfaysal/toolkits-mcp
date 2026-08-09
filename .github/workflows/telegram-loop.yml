@@ -1,0 +1,115 @@
+name: Telegram Seamless Loop
+
+on:
+  repository_dispatch:
+    types: [process_loop]
+
+jobs:
+  build-and-stream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg + awscli
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg awscli
+
+      - name: Configure R2 (S3-compatible) env
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.R2_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.R2_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "R2_ENDPOINT=https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com" >> $GITHUB_ENV
+
+      - name: Download source file (from R2 input_key or Drive link)
+        run: |
+          mkdir -p work
+          if [ -n "${{ github.event.client_payload.input_key }}" ]; then
+            aws s3 cp "s3://toolkits-assets/${{ github.event.client_payload.input_key }}" \
+              work/source_input --endpoint-url "$R2_ENDPOINT"
+          elif [ -n "${{ github.event.client_payload.drive_id }}" ]; then
+            DRIVE_ID="${{ github.event.client_payload.drive_id }}"
+            curl -sc /tmp/cookies "https://drive.google.com/uc?export=download&id=${DRIVE_ID}" > /tmp/page.html
+            CONFIRM=$(grep -o 'confirm=[0-9A-Za-z_]*' /tmp/page.html | head -1 | cut -d= -f2)
+            if [ -n "$CONFIRM" ]; then
+              curl -Lb /tmp/cookies "https://drive.google.com/uc?export=download&confirm=${CONFIRM}&id=${DRIVE_ID}" -o work/source_input
+            else
+              curl -Lb /tmp/cookies "https://drive.google.com/uc?export=download&id=${DRIVE_ID}" -o work/source_input
+            fi
+          else
+            echo "No input_key or drive_id provided"; exit 1
+          fi
+
+      - name: Build seamless loop unit and stream to R2
+        env:
+          IS_VIDEO: ${{ github.event.client_payload.is_video }}
+          TARGET_MINUTES: ${{ github.event.client_payload.target_minutes }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          set -e
+          DURATION_SEC=$((TARGET_MINUTES * 60))
+          TIMESTAMP=$(date +%s)
+
+          if [ "$IS_VIDEO" = "true" ]; then
+            EXT="mp4"
+            C=1.5
+            D=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 work/source_input)
+            BODY=$(python3 -c "print($D - 2*$C)")
+
+            ffmpeg -y -sseof -$C -i work/source_input -t $C -an -c:v libx264 -crf 14 -preset slow work/tail.mp4
+            ffmpeg -y -ss 0 -t $C -i work/source_input -an -c:v libx264 -crf 14 -preset slow work/head.mp4
+            ffmpeg -y -i work/tail.mp4 -i work/head.mp4 -filter_complex \
+              "[0:v][1:v]xfade=transition=fade:duration=$C:offset=0[v]" -map "[v]" \
+              -c:v libx264 -crf 14 -preset slow work/blended.mp4
+            ffmpeg -y -ss $C -t $BODY -i work/source_input -an -c:v libx264 -crf 14 -preset slow work/body.mp4
+            ffmpeg -y -i work/blended.mp4 -i work/body.mp4 -filter_complex \
+              "[0:v][1:v]concat=n=2:v=1:a=0[v]" -map "[v]" \
+              -c:v libx264 -crf 14 -preset slow -g 30 work/loop_unit.mp4
+
+            OUTPUT_KEY="telegram-outputs/${CHAT_ID}-${TIMESTAMP}.${EXT}"
+            ffmpeg -y -stream_loop -1 -i work/loop_unit.mp4 -t $DURATION_SEC \
+              -c copy -movflags +frag_keyframe+empty_moov+default_base_moof \
+              -f mp4 pipe:1 | \
+            aws s3 cp - "s3://toolkits-assets/${OUTPUT_KEY}" --endpoint-url "$R2_ENDPOINT"
+
+          else
+            EXT="mp3"
+            C=3
+            D=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 work/source_input)
+            OUTPUT_KEY="telegram-outputs/${CHAT_ID}-${TIMESTAMP}.${EXT}"
+            ALREADY_LONG_ENOUGH=$(python3 -c "print(1 if $D >= $DURATION_SEC else 0)")
+
+            if [ "$ALREADY_LONG_ENOUGH" = "1" ]; then
+              ffmpeg -y -i work/source_input -t $DURATION_SEC -acodec libmp3lame -b:a 192k -f mp3 pipe:1 | \
+              aws s3 cp - "s3://toolkits-assets/${OUTPUT_KEY}" --endpoint-url "$R2_ENDPOINT"
+            else
+              BODY=$(python3 -c "print($D - 2*$C)")
+              ffmpeg -y -sseof -$C -i work/source_input -t $C work/tail.mp3
+              ffmpeg -y -ss 0 -t $C -i work/source_input work/head.mp3
+              ffmpeg -y -i work/tail.mp3 -i work/head.mp3 -filter_complex \
+                "acrossfade=d=$C:c1=tri:c2=tri" work/blended.mp3
+              ffmpeg -y -ss $C -t $BODY -i work/source_input work/body.mp3
+              ffmpeg -y -i work/blended.mp3 -i work/body.mp3 -filter_complex \
+                "[0:a][1:a]concat=n=2:v=0:a=1[out]" -map "[out]" \
+                -acodec libmp3lame -q:a 2 work/loop_unit.mp3
+
+              ffmpeg -y -stream_loop -1 -i work/loop_unit.mp3 -t $DURATION_SEC \
+                -acodec libmp3lame -b:a 192k -f mp3 pipe:1 | \
+              aws s3 cp - "s3://toolkits-assets/${OUTPUT_KEY}" --endpoint-url "$R2_ENDPOINT"
+            fi
+          fi
+          echo "OUTPUT_KEY=$OUTPUT_KEY" >> $GITHUB_ENV
+
+      - name: Notify user on Telegram with the download link
+        env:
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          DOWNLOAD_URL="${{ vars.R2_PUBLIC_BASE_URL }}/${OUTPUT_KEY}"
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d text="Done! Your seamless loop is ready: ${DOWNLOAD_URL}"
+
+      - name: Clean up R2 source input
+        if: ${{ github.event.client_payload.input_key != '' }}
+        run: |
+          aws s3 rm "s3://toolkits-assets/${{ github.event.client_payload.input_key }}" \
+            --endpoint-url "$R2_ENDPOINT" || true
