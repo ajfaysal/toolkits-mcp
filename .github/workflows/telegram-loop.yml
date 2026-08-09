@@ -11,8 +11,8 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg + awscli
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg awscli
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
 
       - name: Configure R2 (S3-compatible) env
         run: |
@@ -117,11 +117,7 @@ jobs:
         env:
           CHAT_ID: ${{ github.event.client_payload.chat_id }}
         run: |
-          BASE_URL="${{ vars.R2_PUBLIC_BASE_URL }}"
-          if [ -z "$BASE_URL" ]; then
-            BASE_URL="https://pub-754afb105d4d4297ae849b868850f2da.r2.dev"
-          fi
-          DOWNLOAD_URL="${BASE_URL}/${OUTPUT_KEY}"
+          DOWNLOAD_URL="https://pub-754afb105d4d4297ae849b868850f2da.r2.dev/${OUTPUT_KEY}"
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -d chat_id="${CHAT_ID}" \
             -d text="Done! Your seamless loop is ready: ${DOWNLOAD_URL}"
@@ -130,3 +126,4 @@ jobs:
         run: |
           [ -n "${{ github.event.client_payload.input_key }}" ] && aws s3 rm "s3://toolkits-assets/${{ github.event.client_payload.input_key }}" --endpoint-url "$R2_ENDPOINT" || true
           [ -n "${{ github.event.client_payload.audio_input_key }}" ] && aws s3 rm "s3://toolkits-assets/${{ github.event.client_payload.audio_input_key }}" --endpoint-url "$R2_ENDPOINT" || true
+          
