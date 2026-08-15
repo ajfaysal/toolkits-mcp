@@ -1,0 +1,40 @@
+name: FB Audio Extract
+on:
+  repository_dispatch:
+    types: [fb_audio]
+
+jobs:
+  audio:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install ffmpeg
+        run: sudo apt-get install -y ffmpeg
+
+      - name: Pull cached video from R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          JOB_ID="${{ github.event.client_payload.job_id }}"
+          npx wrangler r2 object get "toolkits-assets/fb-cache/${JOB_ID}.mp4" --file=input.mp4 --remote
+
+      - name: Extract MP3 + WAV
+        run: |
+          ffmpeg -i input.mp4 -vn -acodec libmp3lame -q:a 2 output.mp3
+          ffmpeg -i input.mp4 -vn -acodec pcm_s16le -ar 44100 output.wav
+
+      - name: Send audio to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -s -F "chat_id=${CHAT_ID}" -F "audio=@output.mp3" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendAudio"
+          curl -s -F "chat_id=${CHAT_ID}" -F "document=@output.wav" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument"
+
+      - name: Cleanup R2 cache
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          JOB_ID="${{ github.event.client_payload.job_id }}"
+          npx wrangler r2 object delete "toolkits-assets/fb-cache/${JOB_ID}.mp4" --remote
