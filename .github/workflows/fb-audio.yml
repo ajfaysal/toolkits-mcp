@@ -12,10 +12,12 @@ jobs:
 
       - name: Pull cached video from R2
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
         run: |
           JOB_ID="${{ github.event.client_payload.job_id }}"
-          npx wrangler r2 object get "toolkits-assets/fb-cache/${JOB_ID}.mp4" --file=input.mp4 --remote
+          aws s3 cp "s3://toolkits-assets/fb-cache/${JOB_ID}.mp4" input.mp4 --endpoint-url "$R2_ENDPOINT"
 
       - name: Extract MP3 + WAV
         run: |
@@ -34,7 +36,9 @@ jobs:
 
       - name: Cleanup R2 cache
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
         run: |
           JOB_ID="${{ github.event.client_payload.job_id }}"
-          npx wrangler r2 object delete "toolkits-assets/fb-cache/${JOB_ID}.mp4" --remote
+          aws s3 rm "s3://toolkits-assets/fb-cache/${JOB_ID}.mp4" --endpoint-url "$R2_ENDPOINT" || true
