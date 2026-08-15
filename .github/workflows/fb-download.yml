@@ -1,0 +1,43 @@
+name: FB Video Download
+on:
+  repository_dispatch:
+    types: [fb_download]
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install deps
+        run: |
+          pip install -U yt-dlp
+          sudo apt-get install -y ffmpeg
+
+      - name: Download FB video
+        run: |
+          yt-dlp -o "video.%(ext)s" "${{ github.event.client_payload.url }}"
+          mv video.* input.mp4
+
+      - name: Send video to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -s -F "chat_id=${CHAT_ID}" -F "video=@input.mp4" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendVideo"
+
+      - name: Cache video in R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          JOB_ID="${{ github.event.client_payload.job_id }}"
+          npx wrangler r2 object put "toolkits-assets/fb-cache/${JOB_ID}.mp4" --file=input.mp4 --remote
+
+      - name: Ask for audio conversion
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\": \"${CHAT_ID}\", \"text\": \"অডিও ভার্সন (MP3/WAV) লাগবে?\", \"reply_markup\": {\"inline_keyboard\": [[{\"text\": \"🎵 হ্যাঁ, Audio বানাও\", \"callback_data\": \"fb_audio:${JOB_ID}\"}]]}}"
