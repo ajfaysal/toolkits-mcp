@@ -1,7 +1,11 @@
-// LofiMellowBot Telegram Webhook Handler — v2
-// Fixes: (1) pairs audio+video sent separately by the same user into one
+// LofiMellowBot Telegram Webhook Handler — v3
+// v2 fixes: (1) pairs audio+video sent separately by the same user into one
 // combined job instead of processing video alone immediately, using R2 as
 // simple per-chat state storage; (2) uses the correct download link format.
+// v3 adds: Facebook video downloader + MP3/WAV audio extraction, delivered
+// directly inside the chat as files (no external links). Flow: user pastes
+// an FB link -> bot downloads and sends the video -> bot asks (inline button)
+// if an audio version is wanted -> on tap, MP3 + WAV are extracted and sent.
 //
 // Bindings/secrets: TOOLKITS_BUCKET (R2), TELEGRAM_BOT_TOKEN, GITHUB_PAT,
 // GITHUB_OWNER, GITHUB_REPO, R2_PUBLIC_BASE_URL
@@ -38,6 +42,12 @@ export default {
       return new Response("bad request", { status: 400 });
     }
 
+    // --- Inline button presses (e.g. "Make audio" button under an FB video) ---
+    if (update.callback_query) {
+      await handleCallbackQuery(env, update.callback_query);
+      return new Response("ok");
+    }
+
     const message = update.message;
     if (!message) return new Response("ok");
     const chatId = message.chat.id;
@@ -48,7 +58,8 @@ export default {
         "Send me a short video (mp4) and a short/long audio (mp3 file or Google Drive link) — in either order. " +
         "I'll wait for both and combine them into one seamless long loop. " +
         "Or send just one of them and type /skip to process it alone (video gets no audio, audio loops on its own). " +
-        "Caption a file with a number (minutes) to set duration, default 120.");
+        "Caption a file with a number (minutes) to set duration, default 120. " +
+        "\n\nYou can also paste a Facebook video link and I'll send the video back directly, with an option to convert it to MP3/WAV audio.");
       return new Response("ok");
     }
 
@@ -69,6 +80,17 @@ export default {
       return new Response("ok");
     }
 
+    // --- Facebook video link handling ---
+    if (message.text && (message.text.includes("facebook.com") || message.text.includes("fb.watch"))) {
+      const urlMatch = message.text.match(/https?:\/\/\S+/);
+      if (urlMatch) {
+        const jobId = crypto.randomUUID();
+        await dispatchFbJob(env, chatId, "fb_download", { url: urlMatch[0], job_id: jobId });
+        await sendMessage(env, chatId, "ফেসবুক ভিডিও ডাউনলোড হচ্ছে, একটু অপেক্ষা করো...");
+        return new Response("ok");
+      }
+    }
+
     if (message.text && message.text.includes("drive.google.com")) {
       const driveMatch = message.text.match(/[-\w]{25,}/);
       if (driveMatch) {
@@ -82,7 +104,7 @@ export default {
 
     const file = message.audio || message.video || message.document;
     if (!file) {
-      await sendMessage(env, chatId, "Please send an audio/video file, or a Google Drive link for audio.");
+      await sendMessage(env, chatId, "Please send an audio/video file, a Google Drive link for audio, or a Facebook video link.");
       return new Response("ok");
     }
 
@@ -186,6 +208,45 @@ async function dispatchJob(env: Env, chatId: number, payload: Record<string, any
   });
   if (!ghRes.ok) {
     await sendMessage(env, chatId, "Something went wrong dispatching the job: " + await ghRes.text());
+  }
+}
+
+// --- Facebook downloader helpers ---
+
+async function handleCallbackQuery(env: Env, callbackQuery: any) {
+  const data: string = callbackQuery.data || "";
+  const chatId = callbackQuery.message?.chat?.id;
+
+  // Acknowledge the button press so Telegram stops the loading spinner
+  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ callback_query_id: callbackQuery.id }),
+  });
+
+  if (data.startsWith("fb_audio:") && chatId) {
+    const jobId = data.replace("fb_audio:", "");
+    await dispatchFbJob(env, chatId, "fb_audio", { job_id: jobId });
+    await sendMessage(env, chatId, "অডিও (MP3/WAV) বানানো হচ্ছে...");
+  }
+}
+
+async function dispatchFbJob(env: Env, chatId: number, eventType: "fb_download" | "fb_audio", payload: Record<string, any>) {
+  const ghRes = await fetch(`https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/dispatches`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.GITHUB_PAT}`,
+      "Accept": "application/vnd.github+json",
+      "User-Agent": "LofiMellowBot-Worker",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      event_type: eventType,
+      client_payload: { chat_id: chatId, ...payload },
+    }),
+  });
+  if (!ghRes.ok) {
+    await sendMessage(env, chatId, "Something went wrong: " + await ghRes.text());
   }
 }
 
