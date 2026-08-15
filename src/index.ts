@@ -1,11 +1,10 @@
-// LofiMellowBot Telegram Webhook Handler — v3
+// LofiMellowBot Telegram Webhook Handler — v5
 // v2 fixes: (1) pairs audio+video sent separately by the same user into one
 // combined job instead of processing video alone immediately, using R2 as
 // simple per-chat state storage; (2) uses the correct download link format.
-// v3 adds: Facebook video downloader + MP3/WAV audio extraction, delivered
-// directly inside the chat as files (no external links). Flow: user pastes
-// an FB link -> bot downloads and sends the video -> bot asks (inline button)
-// if an audio version is wanted -> on tap, MP3 + WAV are extracted and sent.
+// v3 added: Facebook video downloader + MP3/WAV audio extraction (fb_download/fb_audio).
+// v5 adds: YouTube video downloader + MP3/WAV audio extraction, as a fully
+// separate feature (yt_download/yt_audio) — does not touch the Facebook logic.
 //
 // Bindings/secrets: TOOLKITS_BUCKET (R2), TELEGRAM_BOT_TOKEN, GITHUB_PAT,
 // GITHUB_OWNER, GITHUB_REPO, R2_PUBLIC_BASE_URL
@@ -42,7 +41,7 @@ export default {
       return new Response("bad request", { status: 400 });
     }
 
-    // --- Inline button presses (e.g. "Make audio" button under an FB video) ---
+    // --- Inline button presses (FB audio button, YouTube audio button) ---
     if (update.callback_query) {
       await handleCallbackQuery(env, update.callback_query);
       return new Response("ok");
@@ -59,7 +58,7 @@ export default {
         "I'll wait for both and combine them into one seamless long loop. " +
         "Or send just one of them and type /skip to process it alone (video gets no audio, audio loops on its own). " +
         "Caption a file with a number (minutes) to set duration, default 120. " +
-        "\n\nYou can also paste a Facebook video link and I'll send the video back directly, with an option to convert it to MP3/WAV audio.");
+        "\n\nYou can also paste a Facebook or YouTube video link and I'll send the video back directly, with an option to convert it to MP3/WAV audio.");
       return new Response("ok");
     }
 
@@ -80,13 +79,24 @@ export default {
       return new Response("ok");
     }
 
-    // --- Facebook video link handling ---
+    // --- Facebook video link handling (unchanged, working) ---
     if (message.text && (message.text.includes("facebook.com") || message.text.includes("fb.watch"))) {
       const urlMatch = message.text.match(/https?:\/\/\S+/);
       if (urlMatch) {
         const jobId = crypto.randomUUID();
-        await dispatchFbJob(env, chatId, "fb_download", { url: urlMatch[0], job_id: jobId });
+        await dispatchDownloadJob(env, chatId, "fb_download", { url: urlMatch[0], job_id: jobId });
         await sendMessage(env, chatId, "ফেসবুক ভিডিও ডাউনলোড হচ্ছে, একটু অপেক্ষা করো...");
+        return new Response("ok");
+      }
+    }
+
+    // --- YouTube video link handling (new, separate feature) ---
+    if (message.text && (message.text.includes("youtube.com") || message.text.includes("youtu.be"))) {
+      const urlMatch = message.text.match(/https?:\/\/\S+/);
+      if (urlMatch) {
+        const jobId = crypto.randomUUID();
+        await dispatchDownloadJob(env, chatId, "yt_download", { url: urlMatch[0], job_id: jobId });
+        await sendMessage(env, chatId, "ইউটিউব ভিডিও ডাউনলোড হচ্ছে, একটু অপেক্ষা করো...");
         return new Response("ok");
       }
     }
@@ -104,7 +114,7 @@ export default {
 
     const file = message.audio || message.video || message.document;
     if (!file) {
-      await sendMessage(env, chatId, "Please send an audio/video file, a Google Drive link for audio, or a Facebook video link.");
+      await sendMessage(env, chatId, "Please send an audio/video file, a Google Drive link for audio, or a Facebook/YouTube video link.");
       return new Response("ok");
     }
 
@@ -211,27 +221,37 @@ async function dispatchJob(env: Env, chatId: number, payload: Record<string, any
   }
 }
 
-// --- Facebook downloader helpers ---
+// --- Downloader helpers (shared by Facebook and YouTube, each with its own event_type) ---
 
 async function handleCallbackQuery(env: Env, callbackQuery: any) {
   const data: string = callbackQuery.data || "";
   const chatId = callbackQuery.message?.chat?.id;
 
-  // Acknowledge the button press so Telegram stops the loading spinner
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ callback_query_id: callbackQuery.id }),
   });
 
-  if (data.startsWith("fb_audio:") && chatId) {
+  if (!chatId) return;
+
+  if (data.startsWith("fb_audio:")) {
     const jobId = data.replace("fb_audio:", "");
-    await dispatchFbJob(env, chatId, "fb_audio", { job_id: jobId });
+    await dispatchDownloadJob(env, chatId, "fb_audio", { job_id: jobId });
+    await sendMessage(env, chatId, "অডিও (MP3/WAV) বানানো হচ্ছে...");
+  } else if (data.startsWith("yt_audio:")) {
+    const jobId = data.replace("yt_audio:", "");
+    await dispatchDownloadJob(env, chatId, "yt_audio", { job_id: jobId });
     await sendMessage(env, chatId, "অডিও (MP3/WAV) বানানো হচ্ছে...");
   }
 }
 
-async function dispatchFbJob(env: Env, chatId: number, eventType: "fb_download" | "fb_audio", payload: Record<string, any>) {
+async function dispatchDownloadJob(
+  env: Env,
+  chatId: number,
+  eventType: "fb_download" | "fb_audio" | "yt_download" | "yt_audio",
+  payload: Record<string, any>
+) {
   const ghRes = await fetch(`https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/dispatches`, {
     method: "POST",
     headers: {
