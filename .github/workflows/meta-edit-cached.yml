@@ -7,8 +7,10 @@ jobs:
   edit:
     runs-on: ubuntu-latest
     steps:
-      - name: Install ffmpeg
-        run: sudo apt-get install -y ffmpeg
+      - name: Install deps
+        run: |
+          sudo apt-get install -y ffmpeg
+          pip install -U requests
 
       - name: Pull cached audio from R2
         env:
@@ -20,24 +22,34 @@ jobs:
           aws s3 cp "s3://toolkits-assets/audio-cache/${JOB_ID}.mp3" input.mp3 --endpoint-url "$R2_ENDPOINT"
           aws s3 cp "s3://toolkits-assets/audio-cache/${JOB_ID}.wav" input.wav --endpoint-url "$R2_ENDPOINT"
 
-      - name: Set new title, strip old metadata, rename
+      - name: Set new title, strip old metadata (keeps local filenames ASCII-safe)
         env:
           TITLE: ${{ github.event.client_payload.title }}
-          FILENAME: ${{ github.event.client_payload.filename }}
         run: |
-          ffmpeg -y -i input.mp3 -map_metadata -1 -metadata title="${TITLE}" -c copy "${FILENAME}.mp3"
-          ffmpeg -y -i input.wav -map_metadata -1 -metadata title="${TITLE}" -c copy "${FILENAME}.wav"
+          ffmpeg -y -i input.mp3 -map_metadata -1 -metadata title="${TITLE}" -c copy local_out.mp3
+          ffmpeg -y -i input.wav -map_metadata -1 -metadata title="${TITLE}" -c copy local_out.wav
 
-      - name: Send final files to Telegram
+      - name: Send final files to Telegram with proper Unicode filename
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ github.event.client_payload.chat_id }}
           FILENAME: ${{ github.event.client_payload.filename }}
         run: |
-          curl -s -F "chat_id=${CHAT_ID}" -F "audio=@${FILENAME}.mp3;filename=${FILENAME}.mp3" \
-            "https://api.telegram.org/bot${BOT_TOKEN}/sendAudio"
-          curl -s -F "chat_id=${CHAT_ID}" -F "document=@${FILENAME}.wav;filename=${FILENAME}.wav" \
-            "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument"
+          python3 << 'PYEOF'
+          import os, requests
+
+          bot_token = os.environ["BOT_TOKEN"]
+          chat_id = os.environ["CHAT_ID"]
+          filename = os.environ["FILENAME"]
+
+          for local_file, display_ext, method in [("local_out.mp3", ".mp3", "sendAudio"), ("local_out.wav", ".wav", "sendDocument")]:
+              field = "audio" if method == "sendAudio" else "document"
+              with open(local_file, "rb") as f:
+                  files = {field: (filename + display_ext, f, "application/octet-stream")}
+                  data = {"chat_id": chat_id}
+                  resp = requests.post(f"https://api.telegram.org/bot{bot_token}/{method}", data=data, files=files)
+                  print(resp.status_code, resp.text[:300])
+          PYEOF
 
       - name: Cleanup R2 audio cache
         env:
