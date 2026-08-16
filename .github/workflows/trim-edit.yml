@@ -1,0 +1,107 @@
+name: Trim Editor
+on:
+  repository_dispatch:
+    types: [trim_edit]
+
+jobs:
+  trim:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get install -y ffmpeg
+          pip install -U requests
+
+      - name: Pull file from R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          INPUT_KEY="${{ github.event.client_payload.input_key }}"
+          EXT="${{ github.event.client_payload.ext }}"
+          aws s3 cp "s3://toolkits-assets/${INPUT_KEY}" "input.${EXT}" --endpoint-url "$R2_ENDPOINT"
+
+      - name: Cut the given range out and rejoin the rest
+        env:
+          EXT: ${{ github.event.client_payload.ext }}
+          IS_VIDEO: ${{ github.event.client_payload.is_video }}
+          START_SEC: ${{ github.event.client_payload.start_sec }}
+          END_SEC: ${{ github.event.client_payload.end_sec }}
+        run: |
+          set -e
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "input.${EXT}")
+          echo "Duration: $DURATION, cutting ${START_SEC}s to ${END_SEC}s"
+
+          if [ "$IS_VIDEO" = "true" ]; then
+            VCODEC="-c:v libx264 -crf 18 -preset fast -c:a aac"
+          else
+            if [ "$EXT" = "wav" ]; then
+              VCODEC="-c:a pcm_s16le"
+            else
+              VCODEC="-c:a libmp3lame -q:a 2"
+            fi
+          fi
+
+          HAS_HEAD=$(python3 -c "print('1' if float('$START_SEC') > 0.01 else '0')")
+          HAS_TAIL=$(python3 -c "print('1' if float('$END_SEC') < float('$DURATION') - 0.01 else '0')")
+
+          if [ "$HAS_HEAD" = "1" ] && [ "$HAS_TAIL" = "1" ]; then
+            ffmpeg -y -i "input.${EXT}" -t "$START_SEC" $VCODEC part1."${EXT}"
+            ffmpeg -y -i "input.${EXT}" -ss "$END_SEC" $VCODEC part2."${EXT}"
+            echo "file 'part1.${EXT}'" > list.txt
+            echo "file 'part2.${EXT}'" >> list.txt
+            ffmpeg -y -f concat -safe 0 -i list.txt $VCODEC "local_out.${EXT}"
+          elif [ "$HAS_HEAD" = "1" ]; then
+            ffmpeg -y -i "input.${EXT}" -t "$START_SEC" $VCODEC "local_out.${EXT}"
+          elif [ "$HAS_TAIL" = "1" ]; then
+            ffmpeg -y -i "input.${EXT}" -ss "$END_SEC" $VCODEC "local_out.${EXT}"
+          else
+            echo "Nothing would remain after this cut."
+            exit 1
+          fi
+
+      - name: Send trimmed file back to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          EXT: ${{ github.event.client_payload.ext }}
+          IS_VIDEO: ${{ github.event.client_payload.is_video }}
+        run: |
+          python3 << 'PYEOF'
+          import os, requests
+
+          bot_token = os.environ["BOT_TOKEN"]
+          chat_id = os.environ["CHAT_ID"]
+          ext = os.environ["EXT"]
+          is_video = os.environ.get("IS_VIDEO") == "true"
+
+          method = "sendVideo" if is_video else "sendAudio"
+          field = "video" if is_video else "audio"
+          local_file = f"local_out.{ext}"
+
+          with open(local_file, "rb") as f:
+              files = {field: (f"trimmed.{ext}", f, "application/octet-stream")}
+              data = {"chat_id": chat_id}
+              resp = requests.post(f"https://api.telegram.org/bot{bot_token}/{method}", data=data, files=files)
+              print(resp.status_code, resp.text[:300])
+          PYEOF
+
+      - name: Cleanup R2 input
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          INPUT_KEY="${{ github.event.client_payload.input_key }}"
+          aws s3 rm "s3://toolkits-assets/${INPUT_KEY}" --endpoint-url "$R2_ENDPOINT" || true
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d text="দুঃখিত, ট্রিম করা যায়নি। রেঞ্জটা চেক করে আবার /trim দিয়ে চেষ্টা করো।"
