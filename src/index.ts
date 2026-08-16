@@ -1,13 +1,17 @@
-// LofiMellowBot Telegram Webhook Handler — v9
+// LofiMellowBot Telegram Webhook Handler — v10
 // v2 fixes: pairs audio+video sent separately into one combined job.
 // v3 added: Facebook video downloader + MP3/WAV audio extraction.
 // v5 added: YouTube video downloader + MP3/WAV audio extraction.
 // v6 fixed: multiple links in one message all get downloaded.
 // v7 added: batch "convert all to audio" button for multi-link messages.
 // v8 added: /meta — metadata editor for user-uploaded files.
-// v9 adds: after FB/YT audio conversion finishes, bot asks "edit metadata or
-// skip?" with buttons. Edit reuses the same title/filename flow as /meta,
-// applied to the just-downloaded audio (pulled from a short-lived R2 cache).
+// v9 added: after FB/YT audio conversion, bot asks "edit metadata or skip?".
+// v10 FIXES a bug where editing metadata for concurrent/overlapping songs
+// could apply the wrong title to the wrong file. Now uses Telegram's
+// force_reply: every title/filename prompt is tied to its own message_id,
+// and the user MUST reply directly to that specific prompt. This makes it
+// impossible for two overlapping edit flows to cross-contaminate, no matter
+// how many songs are being processed at once.
 //
 // Bindings/secrets: TOOLKITS_BUCKET (R2), TELEGRAM_BOT_TOKEN, GITHUB_PAT,
 // GITHUB_OWNER, GITHUB_REPO, R2_PUBLIC_BASE_URL
@@ -35,7 +39,7 @@ type BatchState = {
   job_ids: string[];
 };
 
-type MetaState = {
+type EditThread = {
   stage: "awaiting_file" | "awaiting_title" | "awaiting_filename";
   source: "upload" | "cached";
   input_key?: string;
@@ -47,7 +51,7 @@ type MetaState = {
 };
 
 const PENDING_TTL_MS = 15 * 60 * 1000; // 15 minutes to send the pair
-const META_TTL_MS = 20 * 60 * 1000; // 20 minutes to complete the /meta flow
+const EDIT_TTL_MS = 30 * 60 * 1000; // 30 minutes to complete a metadata edit thread
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -71,7 +75,16 @@ export default {
     if (!message) return new Response("ok");
     const chatId = message.chat.id;
     const stateKey = `telegram-state/${chatId}.json`;
-    const metaKey = `telegram-meta/${chatId}.json`;
+
+    // --- Reply-thread metadata edit handling (checked FIRST, before anything else) ---
+    // If this message is a direct reply to one of our own "give me a title" /
+    // "give me a filename" / "send the file" prompts, it belongs to that exact
+    // edit thread and nothing else. This is what prevents cross-contamination
+    // when multiple songs are being processed at the same time.
+    if (message.reply_to_message?.message_id) {
+      const handled = await handleEditThreadReply(env, chatId, message, message.reply_to_message.message_id);
+      if (handled) return new Response("ok");
+    }
 
     if (message.text?.trim() === "/start") {
       await sendMessage(env, chatId,
@@ -80,7 +93,8 @@ export default {
         "Or send just one of them and type /skip to process it alone (video gets no audio, audio loops on its own). " +
         "Caption a file with a number (minutes) to set duration, default 120. " +
         "\n\nYou can also paste one or more Facebook or YouTube video links and I'll send each video back directly, with an option to convert one or all of them to MP3/WAV audio — and after the audio is ready, you'll get the option to edit its title/filename too." +
-        "\n\nType /meta to edit a file's title and filename yourself (strips old metadata, sets a new one).");
+        "\n\nType /meta to edit a file's title and filename yourself (strips old metadata, sets a new one). " +
+        "\n\nImportant: when I ask for a title or filename, always use Telegram's Reply on that exact message — this keeps multiple songs from getting mixed up.");
       return new Response("ok");
     }
 
@@ -103,51 +117,12 @@ export default {
 
     // --- /meta flow start (user uploads their own file) ---
     if (message.text?.trim() === "/meta") {
-      const state: MetaState = { stage: "awaiting_file", source: "upload", timestamp: Date.now() };
-      await env.TOOLKITS_BUCKET.put(metaKey, JSON.stringify(state));
-      await sendMessage(env, chatId, "ফাইল পাঠাও (audio অথবা video) — এর title আর filename বদলে দেব।");
-      return new Response("ok");
-    }
-
-    if (message.text?.trim() === "/cancel") {
-      await env.TOOLKITS_BUCKET.delete(metaKey);
-      await sendMessage(env, chatId, "ঠিক আছে, বাতিল করা হলো।");
-      return new Response("ok");
-    }
-
-    // --- /meta flow: title / filename text steps (works for both "upload" and "cached" sources) ---
-    const metaState = await readMeta(env, metaKey);
-    if (metaState && message.text) {
-      if (metaState.stage === "awaiting_title") {
-        metaState.title = message.text.trim();
-        metaState.stage = "awaiting_filename";
-        metaState.timestamp = Date.now();
-        await env.TOOLKITS_BUCKET.put(metaKey, JSON.stringify(metaState));
-        await sendMessage(env, chatId, "ঠিক আছে। এখন নতুন ফাইলের নাম দাও (extension ছাড়া, শুধু নাম)।");
-        return new Response("ok");
+      const messageId = await sendForceReply(env, chatId, "ফাইল পাঠাও (audio অথবা video) — এই মেসেজে Reply করে পাঠাও।");
+      if (messageId) {
+        const thread: EditThread = { stage: "awaiting_file", source: "upload", timestamp: Date.now() };
+        await env.TOOLKITS_BUCKET.put(`telegram-editthread/${chatId}-${messageId}.json`, JSON.stringify(thread));
       }
-      if (metaState.stage === "awaiting_filename") {
-        const filename = message.text.trim().replace(/[\\/:*?"<>|]/g, "");
-        await env.TOOLKITS_BUCKET.delete(metaKey);
-
-        if (metaState.source === "cached") {
-          await dispatchDownloadJob(env, chatId, "meta_edit_cached", {
-            job_id: metaState.job_id,
-            title: metaState.title,
-            filename,
-          });
-        } else {
-          await dispatchDownloadJob(env, chatId, "meta_edit", {
-            input_key: metaState.input_key,
-            ext: metaState.ext,
-            is_video: metaState.is_video,
-            title: metaState.title,
-            filename,
-          });
-        }
-        await sendMessage(env, chatId, "মেটাডেটা পরিবর্তন হচ্ছে, একটু অপেক্ষা করো...");
-        return new Response("ok");
-      }
+      return new Response("ok");
     }
 
     // --- Facebook video link handling (supports multiple links in one message) ---
@@ -202,17 +177,6 @@ export default {
       const ext = isVideo ? "mp4" : "mp3";
       const inputKey = `telegram-inputs/${chatId}-${Date.now()}.${ext}`;
       await env.TOOLKITS_BUCKET.put(inputKey, fileBytes);
-
-      if (metaState && metaState.stage === "awaiting_file") {
-        metaState.input_key = inputKey;
-        metaState.ext = ext;
-        metaState.is_video = isVideo;
-        metaState.stage = "awaiting_title";
-        metaState.timestamp = Date.now();
-        await env.TOOLKITS_BUCKET.put(metaKey, JSON.stringify(metaState));
-        await sendMessage(env, chatId, "ফাইল পেয়েছি। এখন নতুন Title (শিরোনাম) কী দিতে চাও, লিখে পাঠাও।");
-        return new Response("ok");
-      }
 
       await handleIncoming(env, chatId, stateKey, {
         type: isVideo ? "video" : "audio",
@@ -271,21 +235,6 @@ async function readPending(env: Env, stateKey: string): Promise<PendingState | n
     const state: PendingState = JSON.parse(await obj.text());
     if (Date.now() - state.timestamp > PENDING_TTL_MS) {
       await env.TOOLKITS_BUCKET.delete(stateKey);
-      return null;
-    }
-    return state;
-  } catch {
-    return null;
-  }
-}
-
-async function readMeta(env: Env, metaKey: string): Promise<MetaState | null> {
-  const obj = await env.TOOLKITS_BUCKET.get(metaKey);
-  if (!obj) return null;
-  try {
-    const state: MetaState = JSON.parse(await obj.text());
-    if (Date.now() - state.timestamp > META_TTL_MS) {
-      await env.TOOLKITS_BUCKET.delete(metaKey);
       return null;
     }
     return state;
@@ -386,13 +335,117 @@ async function handleCallbackQuery(env: Env, callbackQuery: any) {
     await sendMessage(env, chatId, `${batch.job_ids.length}টা ভিডিওর Audio (MP3/WAV) বানানো হচ্ছে...`);
   } else if (data.startsWith("dlmeta_edit:")) {
     const jobId = data.replace("dlmeta_edit:", "");
-    const metaKey = `telegram-meta/${chatId}.json`;
-    const state: MetaState = { stage: "awaiting_title", source: "cached", job_id: jobId, timestamp: Date.now() };
-    await env.TOOLKITS_BUCKET.put(metaKey, JSON.stringify(state));
-    await sendMessage(env, chatId, "নতুন Title (শিরোনাম) কী দিতে চাও, লিখে পাঠাও।");
+    const messageId = await sendForceReply(env, chatId, "নতুন Title (শিরোনাম) কী দিতে চাও — এই মেসেজে Reply করে লিখে পাঠাও।");
+    if (messageId) {
+      const thread: EditThread = { stage: "awaiting_title", source: "cached", job_id: jobId, timestamp: Date.now() };
+      await env.TOOLKITS_BUCKET.put(`telegram-editthread/${chatId}-${messageId}.json`, JSON.stringify(thread));
+    }
   } else if (data.startsWith("dlmeta_skip:")) {
     await sendMessage(env, chatId, "ঠিক আছে, আগের ভার্সনটাই final থাকলো।");
   }
+}
+
+// --- Reply-thread based metadata editing (fixes cross-contamination between concurrent songs) ---
+
+async function handleEditThreadReply(env: Env, chatId: number, message: any, repliedToMessageId: number): Promise<boolean> {
+  const key = `telegram-editthread/${chatId}-${repliedToMessageId}.json`;
+  const obj = await env.TOOLKITS_BUCKET.get(key);
+  if (!obj) return false;
+
+  let thread: EditThread;
+  try {
+    thread = JSON.parse(await obj.text());
+  } catch {
+    return false;
+  }
+  if (Date.now() - thread.timestamp > EDIT_TTL_MS) {
+    await env.TOOLKITS_BUCKET.delete(key);
+    await sendMessage(env, chatId, "এই এডিট সেশনের মেয়াদ শেষ হয়ে গেছে, আবার শুরু করো।");
+    return true;
+  }
+
+  if (thread.stage === "awaiting_file") {
+    const file = message.audio || message.video || message.document;
+    if (!file) {
+      await sendMessage(env, chatId, "এটা কোনো ফাইল না মনে হচ্ছে। এই মেসেজে Reply করেই audio/video ফাইল পাঠাও।");
+      return true;
+    }
+    const isVideo = !!message.video || (message.document?.mime_type?.startsWith("video/"));
+    try {
+      const fileInfoRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${file.file_id}`);
+      const fileInfo: any = await fileInfoRes.json();
+      if (!fileInfo.ok) {
+        await sendMessage(env, chatId, "ফাইলটা নিতে সমস্যা হয়েছে (হয়তো ২০MB-র বেশি)। আবার /meta দিয়ে চেষ্টা করো।");
+        await env.TOOLKITS_BUCKET.delete(key);
+        return true;
+      }
+      const telegramFileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`;
+      const fileBytes = await (await fetch(telegramFileUrl)).arrayBuffer();
+      const ext = isVideo ? "mp4" : "mp3";
+      const inputKey = `telegram-inputs/${chatId}-${Date.now()}.${ext}`;
+      await env.TOOLKITS_BUCKET.put(inputKey, fileBytes);
+      await env.TOOLKITS_BUCKET.delete(key);
+
+      const newMessageId = await sendForceReply(env, chatId, "ফাইল পেয়েছি। নতুন Title (শিরোনাম) কী দিতে চাও — এই মেসেজে Reply করে লিখে পাঠাও।");
+      if (newMessageId) {
+        const nextThread: EditThread = {
+          stage: "awaiting_title", source: "upload",
+          input_key: inputKey, ext, is_video: isVideo,
+          timestamp: Date.now(),
+        };
+        await env.TOOLKITS_BUCKET.put(`telegram-editthread/${chatId}-${newMessageId}.json`, JSON.stringify(nextThread));
+      }
+    } catch (err: any) {
+      await sendMessage(env, chatId, "Something went wrong: " + err.message);
+      await env.TOOLKITS_BUCKET.delete(key);
+    }
+    return true;
+  }
+
+  if (thread.stage === "awaiting_title") {
+    if (!message.text) {
+      await sendMessage(env, chatId, "এই মেসেজে Reply করে Title-টা টেক্সট আকারে লিখে পাঠাও।");
+      return true;
+    }
+    const title = message.text.trim();
+    await env.TOOLKITS_BUCKET.delete(key);
+
+    const newMessageId = await sendForceReply(env, chatId, "ঠিক আছে। এখন নতুন ফাইলের নাম দাও (extension ছাড়া, শুধু নাম) — এই মেসেজে Reply করে।");
+    if (newMessageId) {
+      const nextThread: EditThread = { ...thread, stage: "awaiting_filename", title, timestamp: Date.now() };
+      await env.TOOLKITS_BUCKET.put(`telegram-editthread/${chatId}-${newMessageId}.json`, JSON.stringify(nextThread));
+    }
+    return true;
+  }
+
+  if (thread.stage === "awaiting_filename") {
+    if (!message.text) {
+      await sendMessage(env, chatId, "এই মেসেজে Reply করে নতুন ফাইলের নাম টেক্সট আকারে লিখে পাঠাও।");
+      return true;
+    }
+    const filename = message.text.trim().replace(/[\\/:*?"<>|]/g, "");
+    await env.TOOLKITS_BUCKET.delete(key);
+
+    if (thread.source === "cached") {
+      await dispatchDownloadJob(env, chatId, "meta_edit_cached", {
+        job_id: thread.job_id,
+        title: thread.title,
+        filename,
+      });
+    } else {
+      await dispatchDownloadJob(env, chatId, "meta_edit", {
+        input_key: thread.input_key,
+        ext: thread.ext,
+        is_video: thread.is_video,
+        title: thread.title,
+        filename,
+      });
+    }
+    await sendMessage(env, chatId, "মেটাডেটা পরিবর্তন হচ্ছে, একটু অপেক্ষা করো...");
+    return true;
+  }
+
+  return false;
 }
 
 async function dispatchDownloadJob(
@@ -425,4 +478,24 @@ async function sendMessage(env: Env, chatId: number, text: string) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, text }),
   });
+}
+
+// Sends a message with force_reply so the user's next message is tied to
+// THIS exact message via Telegram's reply UI, and returns its message_id.
+async function sendForceReply(env: Env, chatId: number, text: string): Promise<number | null> {
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      reply_markup: { force_reply: true, selective: true },
+    }),
+  });
+  try {
+    const data: any = await res.json();
+    return data?.result?.message_id ?? null;
+  } catch {
+    return null;
+  }
 }
