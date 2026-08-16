@@ -34,7 +34,27 @@ jobs:
           curl -s -F "chat_id=${CHAT_ID}" -F "document=@output.wav" \
             "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument"
 
-      - name: Cleanup R2 cache
+      - name: Cache audio in R2 for optional metadata edit
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          JOB_ID="${{ github.event.client_payload.job_id }}"
+          aws s3 cp output.mp3 "s3://toolkits-assets/audio-cache/${JOB_ID}.mp3" --endpoint-url "$R2_ENDPOINT"
+          aws s3 cp output.wav "s3://toolkits-assets/audio-cache/${JOB_ID}.wav" --endpoint-url "$R2_ENDPOINT"
+
+      - name: Ask about metadata edit
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\": \"${CHAT_ID}\", \"text\": \"এই অডিওর Title/Metadata এডিট করবে?\", \"reply_markup\": {\"inline_keyboard\": [[{\"text\": \"✏️ এডিট করো\", \"callback_data\": \"dlmeta_edit:${JOB_ID}\"}, {\"text\": \"✅ থাক, স্কিপ\", \"callback_data\": \"dlmeta_skip:${JOB_ID}\"}]]}}"
+
+      - name: Cleanup R2 video cache
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -42,3 +62,13 @@ jobs:
         run: |
           JOB_ID="${{ github.event.client_payload.job_id }}"
           aws s3 rm "s3://toolkits-assets/fb-cache/${JOB_ID}.mp4" --endpoint-url "$R2_ENDPOINT" || true
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d text="দুঃখিত, অডিও বানাতে সমস্যা হয়েছে। আবার চেষ্টা করো।"
