@@ -9,12 +9,15 @@ jobs:
     steps:
       - name: Install deps
         run: |
-          pip install -U yt-dlp
+          pip install -U --pre "yt-dlp[default]"
           sudo apt-get install -y ffmpeg
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
 
       - name: Download YouTube video
         run: |
-          yt-dlp -o "video.%(ext)s" "${{ github.event.client_payload.url }}"
+          yt-dlp --extractor-args "youtube:player_client=android,web" \
+            -o "video.%(ext)s" "${{ github.event.client_payload.url }}"
           mv video.* input.mp4
 
       - name: Send video to Telegram
@@ -43,3 +46,13 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -H "Content-Type: application/json" \
             -d "{\"chat_id\": \"${CHAT_ID}\", \"text\": \"অডিও ভার্সন (MP3/WAV) লাগবে?\", \"reply_markup\": {\"inline_keyboard\": [[{\"text\": \"🎵 হ্যাঁ, Audio বানাও\", \"callback_data\": \"yt_audio:${JOB_ID}\"}]]}}"
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d text="দুঃখিত, এই ভিডিওটি ডাউনলোড করা যায়নি। লিংক ভুল হতে পারে, ভিডিওটি প্রাইভেট হতে পারে, অথবা YouTube সাময়িকভাবে ব্লক করছে। একটু পরে আবার চেষ্টা করো।"
