@@ -1,0 +1,60 @@
+name: Metadata Editor (Cached Downloads)
+on:
+  repository_dispatch:
+    types: [meta_edit_cached]
+
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install ffmpeg
+        run: sudo apt-get install -y ffmpeg
+
+      - name: Pull cached audio from R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          JOB_ID="${{ github.event.client_payload.job_id }}"
+          aws s3 cp "s3://toolkits-assets/audio-cache/${JOB_ID}.mp3" input.mp3 --endpoint-url "$R2_ENDPOINT"
+          aws s3 cp "s3://toolkits-assets/audio-cache/${JOB_ID}.wav" input.wav --endpoint-url "$R2_ENDPOINT"
+
+      - name: Set new title, strip old metadata, rename
+        env:
+          TITLE: ${{ github.event.client_payload.title }}
+          FILENAME: ${{ github.event.client_payload.filename }}
+        run: |
+          ffmpeg -y -i input.mp3 -map_metadata -1 -metadata title="${TITLE}" -c copy "${FILENAME}.mp3"
+          ffmpeg -y -i input.wav -map_metadata -1 -metadata title="${TITLE}" -c copy "${FILENAME}.wav"
+
+      - name: Send final files to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          FILENAME: ${{ github.event.client_payload.filename }}
+        run: |
+          curl -s -F "chat_id=${CHAT_ID}" -F "audio=@${FILENAME}.mp3;filename=${FILENAME}.mp3" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendAudio"
+          curl -s -F "chat_id=${CHAT_ID}" -F "document=@${FILENAME}.wav;filename=${FILENAME}.wav" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument"
+
+      - name: Cleanup R2 audio cache
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          JOB_ID="${{ github.event.client_payload.job_id }}"
+          aws s3 rm "s3://toolkits-assets/audio-cache/${JOB_ID}.mp3" --endpoint-url "$R2_ENDPOINT" || true
+          aws s3 rm "s3://toolkits-assets/audio-cache/${JOB_ID}.wav" --endpoint-url "$R2_ENDPOINT" || true
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d text="দুঃখিত, মেটাডেটা এডিট করা যায়নি (হয়তো cache মেয়াদ শেষ হয়ে গেছে — 24 ঘন্টার মধ্যে edit করতে হবে)।"
