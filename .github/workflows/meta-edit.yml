@@ -1,0 +1,77 @@
+name: Metadata Editor
+on:
+  repository_dispatch:
+    types: [meta_edit]
+
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get install -y ffmpeg
+          pip install -U requests
+
+      - name: Pull file from R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          INPUT_KEY="${{ github.event.client_payload.input_key }}"
+          EXT="${{ github.event.client_payload.ext }}"
+          aws s3 cp "s3://toolkits-assets/${INPUT_KEY}" "input.${EXT}" --endpoint-url "$R2_ENDPOINT"
+
+      - name: Set new title, strip old metadata (keeps local filename ASCII-safe)
+        env:
+          TITLE: ${{ github.event.client_payload.title }}
+          EXT: ${{ github.event.client_payload.ext }}
+        run: |
+          ffmpeg -y -i "input.${EXT}" -map_metadata -1 -metadata title="${TITLE}" -c copy "local_out.${EXT}"
+
+      - name: Send file back to Telegram with proper Unicode filename
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          FILENAME: ${{ github.event.client_payload.filename }}
+          EXT: ${{ github.event.client_payload.ext }}
+          IS_VIDEO: ${{ github.event.client_payload.is_video }}
+        run: |
+          python3 << 'PYEOF'
+          import os, requests
+
+          bot_token = os.environ["BOT_TOKEN"]
+          chat_id = os.environ["CHAT_ID"]
+          filename = os.environ["FILENAME"]
+          ext = os.environ["EXT"]
+          is_video = os.environ.get("IS_VIDEO") == "true"
+
+          method = "sendVideo" if is_video else "sendAudio"
+          field = "video" if is_video else "audio"
+          local_file = f"local_out.{ext}"
+
+          with open(local_file, "rb") as f:
+              files = {field: (f"{filename}.{ext}", f, "application/octet-stream")}
+              data = {"chat_id": chat_id}
+              resp = requests.post(f"https://api.telegram.org/bot{bot_token}/{method}", data=data, files=files)
+              print(resp.status_code, resp.text[:300])
+          PYEOF
+
+      - name: Cleanup R2 input
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          INPUT_KEY="${{ github.event.client_payload.input_key }}"
+          aws s3 rm "s3://toolkits-assets/${INPUT_KEY}" --endpoint-url "$R2_ENDPOINT" || true
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d text="দুঃখিত, মেটাডেটা পরিবর্তন করা যায়নি। আবার /meta দিয়ে চেষ্টা করো।"
