@@ -1,4 +1,4 @@
-// LofiMellowBot Telegram Webhook Handler — v11
+// LofiMellowBot Telegram Webhook Handler — v14
 // v2 fixes: pairs audio+video sent separately into one combined job.
 // v3 added: Facebook video downloader + MP3/WAV audio extraction.
 // v5 added: YouTube video downloader + MP3/WAV audio extraction.
@@ -7,12 +7,16 @@
 // v8 added: /meta — metadata editor for user-uploaded files.
 // v9 added: after FB/YT audio conversion, bot asks "edit metadata or skip?".
 // v10 fixed metadata edit cross-contamination using Telegram force_reply threads.
-// v11 adds: /trim — cuts a given second-range OUT of a file (removes that
-// segment, keeps and rejoins the rest). Reuses the same reply-thread system
-// as /meta so concurrent trims never mix up.
+// v11 added: /trim — cuts a given second-range OUT of a file.
+// v12 added: X (Twitter) video downloader.
+// v13 added: copyright/distribution checker via the AudD API (/checkmusic
+// and a button after FB/YT/X audio conversion).
+// v14 adds: /toaudio — upload a video file directly and get it converted to
+// MP3/WAV, no download link needed. Reuses the same audio-cache + metadata
+// edit + copyright check flow as the FB/YT/X downloaders.
 //
 // Bindings/secrets: TOOLKITS_BUCKET (R2), TELEGRAM_BOT_TOKEN, GITHUB_PAT,
-// GITHUB_OWNER, GITHUB_REPO, R2_PUBLIC_BASE_URL
+// GITHUB_OWNER, GITHUB_REPO, R2_PUBLIC_BASE_URL, AUDD_API_TOKEN
 
 export interface Env {
   TOOLKITS_BUCKET: R2Bucket;
@@ -21,7 +25,10 @@ export interface Env {
   GITHUB_OWNER: string;
   GITHUB_REPO: string;
   R2_PUBLIC_BASE_URL: string;
+  AUDD_API_TOKEN: string;
 }
+
+type Platform = "fb" | "yt" | "x";
 
 type PendingState = {
   type: "video" | "audio";
@@ -33,12 +40,12 @@ type PendingState = {
 
 type BatchState = {
   chat_id: number;
-  platform: "fb" | "yt";
+  platform: Platform;
   job_ids: string[];
 };
 
 type ReplyThread = {
-  flow: "meta" | "trim";
+  flow: "meta" | "trim" | "checkmusic" | "toaudio";
   stage: "awaiting_file" | "awaiting_title" | "awaiting_filename" | "awaiting_range";
   source?: "upload" | "cached";
   input_key?: string;
@@ -49,8 +56,26 @@ type ReplyThread = {
   timestamp: number;
 };
 
-const PENDING_TTL_MS = 15 * 60 * 1000; // 15 minutes to send the pair
-const THREAD_TTL_MS = 30 * 60 * 1000; // 30 minutes to complete a reply-thread flow
+const PENDING_TTL_MS = 15 * 60 * 1000;
+const THREAD_TTL_MS = 30 * 60 * 1000;
+
+const PLATFORM_LABEL: Record<Platform, string> = {
+  fb: "ফেসবুক",
+  yt: "ইউটিউব",
+  x: "এক্স (Twitter)",
+};
+
+const DOWNLOAD_EVENT: Record<Platform, string> = {
+  fb: "fb_download",
+  yt: "yt_download",
+  x: "x_download",
+};
+
+const AUDIO_EVENT: Record<Platform, string> = {
+  fb: "fb_audio",
+  yt: "yt_audio",
+  x: "x_audio",
+};
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -75,7 +100,6 @@ export default {
     const chatId = message.chat.id;
     const stateKey = `telegram-state/${chatId}.json`;
 
-    // --- Reply-thread handling (checked FIRST) ---
     if (message.reply_to_message?.message_id) {
       const handled = await handleThreadReply(env, chatId, message, message.reply_to_message.message_id);
       if (handled) return new Response("ok");
@@ -87,8 +111,8 @@ export default {
         "I'll wait for both and combine them into one seamless long loop. " +
         "Or send just one of them and type /skip to process it alone (video gets no audio, audio loops on its own). " +
         "Caption a file with a number (minutes) to set duration, default 120. " +
-        "\n\nYou can also paste one or more Facebook or YouTube video links and I'll send each video back directly, with an option to convert one or all of them to MP3/WAV audio — and after the audio is ready, you'll get the option to edit its title/filename too." +
-        "\n\nType /meta to edit a file's title and filename yourself. Type /trim to cut a specific second-range out of a file. " +
+        "\n\nYou can also paste one or more Facebook, YouTube, or X (Twitter) video links and I'll send each video back directly, with an option to convert one or all of them to MP3/WAV audio — and after the audio is ready, you'll get the option to edit its title/filename or check if it's already distributed elsewhere." +
+        "\n\nType /meta to edit a file's title and filename yourself. Type /trim to cut a specific second-range out of a file. Type /checkmusic to upload an audio file and check if it matches an already-distributed track. Type /toaudio to upload a video and get it converted to MP3/WAV directly. " +
         "\n\nImportant: when I ask for a title, filename, or time range, always use Telegram's Reply on that exact message — this keeps multiple files from getting mixed up.");
       return new Response("ok");
     }
@@ -110,7 +134,6 @@ export default {
       return new Response("ok");
     }
 
-    // --- /meta flow start ---
     if (message.text?.trim() === "/meta") {
       const messageId = await sendForceReply(env, chatId, "ফাইল পাঠাও (audio অথবা video) — এই মেসেজে Reply করে পাঠাও।");
       if (messageId) {
@@ -120,7 +143,6 @@ export default {
       return new Response("ok");
     }
 
-    // --- /trim flow start ---
     if (message.text?.trim() === "/trim") {
       const messageId = await sendForceReply(env, chatId, "যে ফাইলটা ট্রিম করতে চাও সেটা পাঠাও (audio অথবা video) — এই মেসেজে Reply করে পাঠাও।");
       if (messageId) {
@@ -130,7 +152,25 @@ export default {
       return new Response("ok");
     }
 
-    // --- Facebook video link handling (supports multiple links in one message) ---
+    if (message.text?.trim() === "/checkmusic") {
+      const messageId = await sendForceReply(env, chatId, "যে অডিও ফাইলটা কপিরাইট/ডিস্ট্রিবিউশন চেক করতে চাও সেটা পাঠাও — এই মেসেজে Reply করে পাঠাও।");
+      if (messageId) {
+        const thread: ReplyThread = { flow: "checkmusic", stage: "awaiting_file", timestamp: Date.now() };
+        await env.TOOLKITS_BUCKET.put(`telegram-editthread/${chatId}-${messageId}.json`, JSON.stringify(thread));
+      }
+      return new Response("ok");
+    }
+
+    if (message.text?.trim() === "/toaudio") {
+      const messageId = await sendForceReply(env, chatId, "যে ভিডিওটা অডিওতে কনভার্ট করতে চাও সেটা পাঠাও — এই মেসেজে Reply করে পাঠাও।");
+      if (messageId) {
+        const thread: ReplyThread = { flow: "toaudio", stage: "awaiting_file", timestamp: Date.now() };
+        await env.TOOLKITS_BUCKET.put(`telegram-editthread/${chatId}-${messageId}.json`, JSON.stringify(thread));
+      }
+      return new Response("ok");
+    }
+
+    // --- Facebook video link handling ---
     if (message.text && (message.text.includes("facebook.com") || message.text.includes("fb.watch"))) {
       const urls = Array.from(message.text.matchAll(/https?:\/\/\S+/g)).map((m: any) => m[0]);
       if (urls.length > 0) {
@@ -139,11 +179,20 @@ export default {
       }
     }
 
-    // --- YouTube video link handling (supports multiple links in one message) ---
+    // --- YouTube video link handling ---
     if (message.text && (message.text.includes("youtube.com") || message.text.includes("youtu.be"))) {
       const urls = Array.from(message.text.matchAll(/https?:\/\/\S+/g)).map((m: any) => m[0]);
       if (urls.length > 0) {
         await handleMultiDownload(env, chatId, "yt", urls);
+        return new Response("ok");
+      }
+    }
+
+    // --- X (Twitter) video link handling ---
+    if (message.text && (message.text.includes("twitter.com") || message.text.includes("x.com"))) {
+      const urls = Array.from(message.text.matchAll(/https?:\/\/\S+/g)).map((m: any) => m[0]);
+      if (urls.length > 0) {
+        await handleMultiDownload(env, chatId, "x", urls);
         return new Response("ok");
       }
     }
@@ -161,7 +210,7 @@ export default {
 
     const file = message.audio || message.video || message.document;
     if (!file) {
-      await sendMessage(env, chatId, "Please send an audio/video file, a Google Drive link for audio, or a Facebook/YouTube video link. Or type /meta or /trim.");
+      await sendMessage(env, chatId, "Please send an audio/video file, a Google Drive link for audio, or a Facebook/YouTube/X video link. Or type /meta, /trim, /checkmusic, or /toaudio.");
       return new Response("ok");
     }
 
@@ -267,12 +316,12 @@ async function dispatchJob(env: Env, chatId: number, payload: Record<string, any
   }
 }
 
-// --- Downloader helpers (shared by Facebook and YouTube) ---
+// --- Downloader helpers (shared by Facebook, YouTube, X) ---
 
-async function handleMultiDownload(env: Env, chatId: number, platform: "fb" | "yt", urls: string[]) {
+async function handleMultiDownload(env: Env, chatId: number, platform: Platform, urls: string[]) {
   const jobIds: string[] = [];
-  const downloadEvent = platform === "fb" ? "fb_download" : "yt_download";
-  const platformLabel = platform === "fb" ? "ফেসবুক" : "ইউটিউব";
+  const downloadEvent = DOWNLOAD_EVENT[platform];
+  const platformLabel = PLATFORM_LABEL[platform];
 
   for (const url of urls) {
     const jobId = crypto.randomUUID();
@@ -324,6 +373,10 @@ async function handleCallbackQuery(env: Env, callbackQuery: any) {
     const jobId = data.replace("yt_audio:", "");
     await dispatchDownloadJob(env, chatId, "yt_audio", { job_id: jobId });
     await sendMessage(env, chatId, "অডিও (MP3/WAV) বানানো হচ্ছে...");
+  } else if (data.startsWith("x_audio:")) {
+    const jobId = data.replace("x_audio:", "");
+    await dispatchDownloadJob(env, chatId, "x_audio", { job_id: jobId });
+    await sendMessage(env, chatId, "অডিও (MP3/WAV) বানানো হচ্ছে...");
   } else if (data.startsWith("batch_audio:")) {
     const batchId = data.replace("batch_audio:", "");
     const obj = await env.TOOLKITS_BUCKET.get(`telegram-batch/${batchId}.json`);
@@ -332,7 +385,7 @@ async function handleCallbackQuery(env: Env, callbackQuery: any) {
       return;
     }
     const batch: BatchState = JSON.parse(await obj.text());
-    const audioEvent = batch.platform === "fb" ? "fb_audio" : "yt_audio";
+    const audioEvent = AUDIO_EVENT[batch.platform];
     for (const jobId of batch.job_ids) {
       await dispatchDownloadJob(env, chatId, audioEvent, { job_id: jobId });
     }
@@ -347,10 +400,61 @@ async function handleCallbackQuery(env: Env, callbackQuery: any) {
     }
   } else if (data.startsWith("dlmeta_skip:")) {
     await sendMessage(env, chatId, "ঠিক আছে, আগের ভার্সনটাই final থাকলো।");
+  } else if (data.startsWith("copyright_check:")) {
+    const jobId = data.replace("copyright_check:", "");
+    await sendMessage(env, chatId, "কপিরাইট/ডিস্ট্রিবিউশন চেক করা হচ্ছে, একটু অপেক্ষা করো...");
+    await runCopyrightCheck(env, chatId, `audio-cache/${jobId}.mp3`);
   }
 }
 
-// --- Reply-thread handling (shared by /meta and /trim, prevents cross-contamination) ---
+// --- Copyright checker (AudD API, runs directly in the Worker) ---
+
+async function runCopyrightCheck(env: Env, chatId: number, r2Key: string) {
+  try {
+    const obj = await env.TOOLKITS_BUCKET.get(r2Key);
+    if (!obj) {
+      await sendMessage(env, chatId, "দুঃখিত, এই অডিওটা আর cache-এ নেই (মেয়াদ শেষ হয়ে গেছে), চেক করা যাচ্ছে না।");
+      return;
+    }
+    const blob = await obj.blob();
+
+    const form = new FormData();
+    form.append("api_token", env.AUDD_API_TOKEN);
+    form.append("file", blob, "audio.mp3");
+    form.append("return", "spotify,apple_music,deezer");
+
+    const res = await fetch("https://api.audd.io/", { method: "POST", body: form });
+    const data: any = await res.json();
+
+    if (data.status !== "success") {
+      await sendMessage(env, chatId, "চেক করতে সমস্যা হয়েছে: " + (data.error?.error_message || "unknown error"));
+      return;
+    }
+
+    const result = data.result;
+    if (!result) {
+      await sendMessage(env, chatId,
+        "✅ কোনো ম্যাচ পাওয়া যায়নি — এই exact অডিওটা AudD-এর ডাটাবেজে থাকা কোনো distributed track-এর সাথে মেলেনি।\n\n" +
+        "⚠️ মনে রাখবে: বাংলা/আঞ্চলিক গানের ক্ষেত্রে coverage কম হতে পারে, তাই এটা 100% guarantee না যে গানটা সম্পূর্ণ unreleased।");
+      return;
+    }
+
+    let msg = "⚠️ ম্যাচ পাওয়া গেছে — এই অডিওটা ইতিমধ্যে distributed মনে হচ্ছে:\n\n";
+    msg += `🎵 Title: ${result.title || "N/A"}\n`;
+    msg += `🎤 Artist: ${result.artist || "N/A"}\n`;
+    if (result.album) msg += `💿 Album: ${result.album}\n`;
+    if (result.release_date) msg += `📅 Release: ${result.release_date}\n`;
+    if (result.label) msg += `🏷️ Label: ${result.label}\n`;
+    if (result.spotify?.external_urls?.spotify) msg += `\nSpotify: ${result.spotify.external_urls.spotify}\n`;
+    if (result.apple_music?.url) msg += `Apple Music: ${result.apple_music.url}\n`;
+
+    await sendMessage(env, chatId, msg);
+  } catch (err: any) {
+    await sendMessage(env, chatId, "চেক করতে সমস্যা হয়েছে: " + err.message);
+  }
+}
+
+// --- Reply-thread handling (shared by /meta, /trim, /checkmusic, /toaudio) ---
 
 async function handleThreadReply(env: Env, chatId: number, message: any, repliedToMessageId: number): Promise<boolean> {
   const key = `telegram-editthread/${chatId}-${repliedToMessageId}.json`;
@@ -369,7 +473,6 @@ async function handleThreadReply(env: Env, chatId: number, message: any, replied
     return true;
   }
 
-  // --- Shared step: receiving the file (used by both /meta upload flow and /trim) ---
   if (thread.stage === "awaiting_file") {
     const file = message.audio || message.video || message.document;
     if (!file) {
@@ -401,9 +504,9 @@ async function handleThreadReply(env: Env, chatId: number, message: any, replied
           };
           await env.TOOLKITS_BUCKET.put(`telegram-editthread/${chatId}-${newMessageId}.json`, JSON.stringify(next));
         }
-      } else {
+      } else if (thread.flow === "trim") {
         const newMessageId = await sendForceReply(env, chatId,
-          "ফাইল পেয়েছি। কোন সেকেন্ড থেকে কোন সেকেন্ড পর্যন্ত বাদ দিবে? এই মেসেজে Reply করে লিখো, যেমন: 10-25 (মানে ১০ সেকেন্ড থেকে ২৫ সেকেন্ড পর্যন্ত অংশটা বাদ যাবে, বাকিটা জোড়া লেগে ফেরত আসবে)।");
+          "ফাইল পেয়েছি। কোন সেকেন্ড থেকে কোন সেকেন্ড পর্যন্ত বাদ দিবে? এই মেসেজে Reply করে লিখো, যেমন: 10-25");
         if (newMessageId) {
           const next: ReplyThread = {
             flow: "trim", stage: "awaiting_range",
@@ -411,6 +514,21 @@ async function handleThreadReply(env: Env, chatId: number, message: any, replied
           };
           await env.TOOLKITS_BUCKET.put(`telegram-editthread/${chatId}-${newMessageId}.json`, JSON.stringify(next));
         }
+      } else if (thread.flow === "checkmusic") {
+        if (isVideo) {
+          await sendMessage(env, chatId, "এটা video ফাইল মনে হচ্ছে। /checkmusic শুধু audio ফাইলের জন্য — audio (mp3/wav) পাঠাও।");
+          return true;
+        }
+        await sendMessage(env, chatId, "কপিরাইট/ডিস্ট্রিবিউশন চেক করা হচ্ছে, একটু অপেক্ষা করো...");
+        await runCopyrightCheck(env, chatId, inputKey);
+      } else if (thread.flow === "toaudio") {
+        if (!isVideo) {
+          await sendMessage(env, chatId, "এটা তো ইতিমধ্যে audio ফাইল, কনভার্ট করার দরকার নেই।");
+          return true;
+        }
+        const jobId = crypto.randomUUID();
+        await dispatchDownloadJob(env, chatId, "video_to_audio", { input_key: inputKey, ext, job_id: jobId });
+        await sendMessage(env, chatId, "ভিডিও থেকে অডিও বানানো হচ্ছে, একটু অপেক্ষা করো...");
       }
     } catch (err: any) {
       await sendMessage(env, chatId, "Something went wrong: " + err.message);
@@ -419,7 +537,6 @@ async function handleThreadReply(env: Env, chatId: number, message: any, replied
     return true;
   }
 
-  // --- /meta: title step ---
   if (thread.stage === "awaiting_title") {
     if (!message.text) {
       await sendMessage(env, chatId, "এই মেসেজে Reply করে Title-টা টেক্সট আকারে লিখে পাঠাও।");
@@ -436,7 +553,6 @@ async function handleThreadReply(env: Env, chatId: number, message: any, replied
     return true;
   }
 
-  // --- /meta: filename step (final) ---
   if (thread.stage === "awaiting_filename") {
     if (!message.text) {
       await sendMessage(env, chatId, "এই মেসেজে Reply করে নতুন ফাইলের নাম টেক্সট আকারে লিখে পাঠাও।");
@@ -457,7 +573,6 @@ async function handleThreadReply(env: Env, chatId: number, message: any, replied
     return true;
   }
 
-  // --- /trim: range step (final) ---
   if (thread.stage === "awaiting_range") {
     if (!message.text) {
       await sendMessage(env, chatId, "এই মেসেজে Reply করে রেঞ্জ লিখো, যেমন: 10-25");
@@ -490,12 +605,7 @@ async function handleThreadReply(env: Env, chatId: number, message: any, replied
   return false;
 }
 
-async function dispatchDownloadJob(
-  env: Env,
-  chatId: number,
-  eventType: "fb_download" | "fb_audio" | "yt_download" | "yt_audio" | "meta_edit" | "meta_edit_cached" | "trim_edit",
-  payload: Record<string, any>
-) {
+async function dispatchDownloadJob(env: Env, chatId: number, eventType: string, payload: Record<string, any>) {
   const ghRes = await fetch(`https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/dispatches`, {
     method: "POST",
     headers: {
