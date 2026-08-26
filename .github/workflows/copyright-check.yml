@@ -1,0 +1,153 @@
+name: Copyright Check (ACRCloud, multi-segment scan)
+on:
+  repository_dispatch:
+    types: [copyright_check_run]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install ffmpeg + python deps
+        run: |
+          sudo apt-get install -y ffmpeg
+          pip install -U requests
+
+      - name: Pull audio from R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          R2_KEY="${{ github.event.client_payload.r2_key }}"
+          aws s3 cp "s3://toolkits-assets/${R2_KEY}" input_raw --endpoint-url "$R2_ENDPOINT"
+
+      - name: Cut 4 segments spread across the full song
+        run: |
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 input_raw)
+          python3 -c "
+          d = float('$DURATION')
+          fractions = [0.10, 0.35, 0.60, 0.85]
+          seg = 15
+          for i, frac in enumerate(fractions):
+              offset = frac * d
+              if offset + seg > d:
+                  offset = max(0, d - seg)
+              print(round(offset, 1))
+          " > offsets.txt
+
+          i=1
+          while read -r OFFSET; do
+            ffmpeg -y -i input_raw -ss "$OFFSET" -t 15 -acodec libmp3lame -ar 44100 -ac 2 -b:a 128k "clip_${i}.mp3"
+            i=$((i+1))
+          done < offsets.txt
+
+      - name: Scan all segments via ACRCloud, stop at first match
+        env:
+          ACRCLOUD_ACCESS_KEY: ${{ secrets.ACRCLOUD_ACCESS_KEY }}
+          ACRCLOUD_ACCESS_SECRET: ${{ secrets.ACRCLOUD_ACCESS_SECRET }}
+          ACRCLOUD_HOST: ${{ secrets.ACRCLOUD_HOST }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          python3 << 'PYEOF'
+          import os, hmac, hashlib, base64, time, requests, glob
+
+          access_key = os.environ["ACRCLOUD_ACCESS_KEY"]
+          access_secret = os.environ["ACRCLOUD_ACCESS_SECRET"]
+          host = os.environ["ACRCLOUD_HOST"]
+          bot_token = os.environ["BOT_TOKEN"]
+          chat_id = os.environ["CHAT_ID"]
+
+          def send_message(text):
+              requests.post(
+                  f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                  data={"chat_id": chat_id, "text": text},
+              )
+
+          def identify(filepath):
+              timestamp = str(int(time.time()))
+              string_to_sign = f"POST\n/v1/identify\n{access_key}\naudio\n1\n{timestamp}"
+              signature = base64.b64encode(
+                  hmac.new(access_secret.encode(), string_to_sign.encode(), hashlib.sha1).digest()
+              ).decode()
+              with open(filepath, "rb") as f:
+                  sample_bytes = f.read()
+              files = {"sample": (os.path.basename(filepath), sample_bytes, "audio/mpeg")}
+              data = {
+                  "access_key": access_key,
+                  "sample_bytes": str(len(sample_bytes)),
+                  "timestamp": timestamp,
+                  "signature": signature,
+                  "data_type": "audio",
+                  "signature_version": "1",
+              }
+              resp = requests.post(f"https://{host}/v1/identify", data=data, files=files)
+              return resp.json()
+
+          clips = sorted(glob.glob("clip_*.mp3"))
+          match_found = False
+          last_error = None
+
+          for clip in clips:
+              result = identify(clip)
+              print(f"{clip}: {result}")
+              status_code = result.get("status", {}).get("code")
+
+              if status_code == 0 and result.get("metadata", {}).get("music"):
+                  match_found = True
+                  m = result["metadata"]["music"][0]
+                  msg = f"⚠️ ম্যাচ পাওয়া গেছে (গানের একটা অংশে) — এই গানটা ইতিমধ্যে distributed:\n\n"
+                  msg += f"🎵 Title: {m.get('title', 'N/A')}\n"
+                  artists = ", ".join(a.get("name", "") for a in m.get("artists", []))
+                  msg += f"🎤 Artist: {artists or 'N/A'}\n"
+                  if m.get("album", {}).get("name"):
+                      msg += f"💿 Album: {m['album']['name']}\n"
+                  if m.get("release_date"):
+                      msg += f"📅 Release: {m['release_date']}\n"
+                  if m.get("label"):
+                      msg += f"🏷️ Label: {m['label']}\n"
+                  ext_ids = m.get("external_ids", {})
+                  if ext_ids.get("isrc"):
+                      msg += f"🔢 ISRC: {ext_ids['isrc']}\n"
+                  if ext_ids.get("upc"):
+                      msg += f"🔢 UPC: {ext_ids['upc']}\n"
+
+                  ext_meta = m.get("external_metadata", {})
+                  platforms = []
+                  if ext_meta.get("spotify", {}).get("track", {}).get("id"):
+                      platforms.append(f"🎧 Spotify: https://open.spotify.com/track/{ext_meta['spotify']['track']['id']}")
+                  if ext_meta.get("youtube", {}).get("vid"):
+                      platforms.append(f"▶️ YouTube: https://youtube.com/watch?v={ext_meta['youtube']['vid']}")
+                  if ext_meta.get("deezer", {}).get("track", {}).get("id"):
+                      platforms.append(f"🎵 Deezer: https://www.deezer.com/track/{ext_meta['deezer']['track']['id']}")
+
+                  if platforms:
+                      msg += "\n📍 যে যে platform-এ পাওয়া গেছে:\n" + "\n".join(platforms)
+                  else:
+                      msg += "\n📍 কোনো specific platform link পাওয়া যায়নি, তবে ম্যাচ আছে।"
+
+                  send_message(msg)
+                  break
+              elif status_code not in (0, 1001):
+                  last_error = result.get("status", {}).get("msg", "unknown error")
+
+          if not match_found:
+              if last_error:
+                  send_message(f"চেক করতে সমস্যা হয়েছে: {last_error}")
+              else:
+                  send_message(
+                      "✅ কোনো ম্যাচ পাওয়া যায়নি — গানের ৪টা ভিন্ন অংশ (শুরু, মাঝ, শেষের দিক) চেক করা হয়েছে, "
+                      "কোনোটাই ACRCloud-এর ডাটাবেজে থাকা distributed track-এর সাথে মেলেনি।\n\n"
+                      "⚠️ মনে রাখবে: বাংলা/আঞ্চলিক গানের ক্ষেত্রে coverage কম হতে পারে, তাই এটা 100% guarantee না।"
+                  )
+          PYEOF
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d text="দুঃখিত, কপিরাইট চেক করা যায়নি। আবার চেষ্টা করো।"
