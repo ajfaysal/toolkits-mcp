@@ -1,4 +1,4 @@
-// LofiMellowBot Telegram Webhook Handler — v16
+// LofiMellowBot Telegram Webhook Handler — v18
 // v2 fixes: pairs audio+video sent separately into one combined job.
 // v3 added: Facebook video downloader + MP3/WAV audio extraction.
 // v5 added: YouTube video downloader + MP3/WAV audio extraction.
@@ -9,16 +9,18 @@
 // v10 fixed metadata edit cross-contamination using Telegram force_reply threads.
 // v11 added: /trim — cuts a given second-range OUT of a file.
 // v12 added: X (Twitter) video downloader.
-// v13 added: copyright/distribution checker via the AudD API.
-// v14 added: /toaudio — upload a video directly, get MP3/WAV back.
-// v15 added a second checker (ACRCloud) alongside AudD.
-// v16 simplifies the copyright checker to ACRCloud ONLY (AudD removed), and
-// lists exactly which platforms (Spotify/YouTube/Deezer/Apple Music/ISRC/UPC)
-// the match was found under.
+// v13-v17 iterated a copyright checker (AudD, then ACRCloud) inside the Worker.
+// v18 moves the copyright check entirely into a GitHub Actions workflow
+// (copyright-check.yml), which uses ffmpeg to cut proper audio segments and
+// Python's HMAC library to sign requests to ACRCloud — avoiding the
+// "invalid signature" and "file too large" issues from the Worker-only
+// approach. The Worker now just dispatches the job and waits for the
+// workflow to message the user directly.
 //
 // Bindings/secrets: TOOLKITS_BUCKET (R2), TELEGRAM_BOT_TOKEN, GITHUB_PAT,
-// GITHUB_OWNER, GITHUB_REPO, R2_PUBLIC_BASE_URL, ACRCLOUD_ACCESS_KEY,
-// ACRCLOUD_ACCESS_SECRET, ACRCLOUD_HOST
+// GITHUB_OWNER, GITHUB_REPO, R2_PUBLIC_BASE_URL
+// (ACRCloud credentials now live as GitHub repo secrets, used only inside
+// copyright-check.yml — not needed by the Worker anymore.)
 
 export interface Env {
   TOOLKITS_BUCKET: R2Bucket;
@@ -27,9 +29,6 @@ export interface Env {
   GITHUB_OWNER: string;
   GITHUB_REPO: string;
   R2_PUBLIC_BASE_URL: string;
-  ACRCLOUD_ACCESS_KEY: string;
-  ACRCLOUD_ACCESS_SECRET: string;
-  ACRCLOUD_HOST: string;
 }
 
 type Platform = "fb" | "yt" | "x";
@@ -157,7 +156,7 @@ export default {
     }
 
     if (message.text?.trim() === "/checkmusic") {
-      const messageId = await sendForceReply(env, chatId, "যে অডিও ফাইলটা কপিরাইট/ডিস্ট্রিবিউশন চেক করতে চাও সেটা পাঠাও — এই মেসেজে Reply করে পাঠাও।");
+      const messageId = await sendForceReply(env, chatId, "যে অডিও ফাইলটা কপিরাইট/ডিস্ট্রিবিউশন চেক করতে চাও সেটা পাঠাও — এই মেসেজে Reply করে পাঠাও (যেকোনো সাইজ ঠিক আছে)।");
       if (messageId) {
         const thread: ReplyThread = { flow: "checkmusic", stage: "awaiting_file", timestamp: Date.now() };
         await env.TOOLKITS_BUCKET.put(`telegram-editthread/${chatId}-${messageId}.json`, JSON.stringify(thread));
@@ -406,105 +405,8 @@ async function handleCallbackQuery(env: Env, callbackQuery: any) {
     await sendMessage(env, chatId, "ঠিক আছে, আগের ভার্সনটাই final থাকলো।");
   } else if (data.startsWith("copyright_check:")) {
     const jobId = data.replace("copyright_check:", "");
-    await sendMessage(env, chatId, "কপিরাইট/ডিস্ট্রিবিউশন চেক করা হচ্ছে (ACRCloud), একটু অপেক্ষা করো...");
-    await runCopyrightCheck(env, chatId, `audio-cache/${jobId}.mp3`);
-  }
-}
-
-// --- Copyright checker: ACRCloud only, lists matched platforms ---
-
-async function acrCloudSign(stringToSign: string, secret: string): Promise<string> {
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw", enc.encode(secret), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(stringToSign));
-  return btoa(String.fromCharCode(...new Uint8Array(sig)));
-}
-
-async function callACRCloud(env: Env, arrayBuffer: ArrayBuffer): Promise<any> {
-  const accessKey = env.ACRCLOUD_ACCESS_KEY;
-  const accessSecret = env.ACRCLOUD_ACCESS_SECRET;
-  const host = env.ACRCLOUD_HOST;
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  const stringToSign = `POST\n/v1/identify\n${accessKey}\naudio\n1\n${timestamp}`;
-  const signature = await acrCloudSign(stringToSign, accessSecret);
-
-  const form = new FormData();
-  form.append("sample", new Blob([arrayBuffer]), "sample.mp3");
-  form.append("access_key", accessKey);
-  form.append("sample_bytes", arrayBuffer.byteLength.toString());
-  form.append("timestamp", timestamp);
-  form.append("signature", signature);
-  form.append("data_type", "audio");
-  form.append("signature_version", "1");
-
-  const res = await fetch(`https://${host}/v1/identify`, { method: "POST", body: form });
-  return await res.json();
-}
-
-function buildPlatformList(externalMetadata: any): string[] {
-  const found: string[] = [];
-  if (!externalMetadata) return found;
-
-  if (externalMetadata.spotify?.track?.id) {
-    found.push(`🎧 Spotify: https://open.spotify.com/track/${externalMetadata.spotify.track.id}`);
-  }
-  if (externalMetadata.youtube?.vid) {
-    found.push(`▶️ YouTube: https://youtube.com/watch?v=${externalMetadata.youtube.vid}`);
-  }
-  if (externalMetadata.deezer?.track?.id) {
-    found.push(`🎵 Deezer: https://www.deezer.com/track/${externalMetadata.deezer.track.id}`);
-  }
-  if (externalMetadata.applemusic?.track?.id || externalMetadata.apple_music?.track?.id) {
-    found.push(`🍎 Apple Music: match পাওয়া গেছে`);
-  }
-  return found;
-}
-
-async function runCopyrightCheck(env: Env, chatId: number, r2Key: string) {
-  try {
-    const obj = await env.TOOLKITS_BUCKET.get(r2Key);
-    if (!obj) {
-      await sendMessage(env, chatId, "দুঃখিত, এই অডিওটা আর cache-এ নেই (মেয়াদ শেষ হয়ে গেছে), চেক করা যাচ্ছে না।");
-      return;
-    }
-    const arrayBuffer = await obj.arrayBuffer();
-    const acrData = await callACRCloud(env, arrayBuffer);
-
-    if (acrData.status?.code === 1001) {
-      await sendMessage(env, chatId,
-        "✅ কোনো ম্যাচ পাওয়া যায়নি — এই exact অডিওটা ACRCloud-এর ডাটাবেজে থাকা কোনো distributed track-এর সাথে মেলেনি।\n\n" +
-        "⚠️ মনে রাখবে: বাংলা/আঞ্চলিক গানের ক্ষেত্রে coverage কম হতে পারে, তাই এটা 100% guarantee না যে গানটা সম্পূর্ণ unreleased।");
-      return;
-    }
-
-    if (acrData.status?.code !== 0 || !acrData.metadata?.music?.length) {
-      await sendMessage(env, chatId, "চেক করতে সমস্যা হয়েছে: " + (acrData.status?.msg || "unknown error"));
-      return;
-    }
-
-    const m = acrData.metadata.music[0];
-    const platforms = buildPlatformList(m.external_metadata);
-
-    let msg = "⚠️ ম্যাচ পাওয়া গেছে — এই গানটা ইতিমধ্যে distributed:\n\n";
-    msg += `🎵 Title: ${m.title || "N/A"}\n`;
-    msg += `🎤 Artist: ${m.artists?.map((a: any) => a.name).join(", ") || "N/A"}\n`;
-    if (m.album?.name) msg += `💿 Album: ${m.album.name}\n`;
-    if (m.release_date) msg += `📅 Release: ${m.release_date}\n`;
-    if (m.label) msg += `🏷️ Label: ${m.label}\n`;
-    if (m.external_ids?.isrc) msg += `🔢 ISRC: ${m.external_ids.isrc}\n`;
-    if (m.external_ids?.upc) msg += `🔢 UPC: ${m.external_ids.upc}\n`;
-
-    if (platforms.length > 0) {
-      msg += `\n📍 যে যে platform-এ পাওয়া গেছে:\n${platforms.join("\n")}`;
-    } else {
-      msg += `\n📍 কোনো specific platform link পাওয়া যায়নি, তবে ম্যাচ আছে।`;
-    }
-
-    await sendMessage(env, chatId, msg);
-  } catch (err: any) {
-    await sendMessage(env, chatId, "চেক করতে সমস্যা হয়েছে: " + err.message);
+    await sendMessage(env, chatId, "কপিরাইট/ডিস্ট্রিবিউশন চেক করা হচ্ছে, একটু অপেক্ষা করো (৪টা অংশ চেক হবে, সময় লাগবে)...");
+    await dispatchDownloadJob(env, chatId, "copyright_check_run", { r2_key: `audio-cache/${jobId}.mp3` });
   }
 }
 
@@ -573,8 +475,8 @@ async function handleThreadReply(env: Env, chatId: number, message: any, replied
           await sendMessage(env, chatId, "এটা video ফাইল মনে হচ্ছে। /checkmusic শুধু audio ফাইলের জন্য — audio (mp3/wav) পাঠাও।");
           return true;
         }
-        await sendMessage(env, chatId, "কপিরাইট/ডিস্ট্রিবিউশন চেক করা হচ্ছে (ACRCloud), একটু অপেক্ষা করো...");
-        await runCopyrightCheck(env, chatId, inputKey);
+        await sendMessage(env, chatId, "কপিরাইট/ডিস্ট্রিবিউশন চেক করা হচ্ছে, একটু অপেক্ষা করো (৪টা অংশ চেক হবে, সময় লাগবে)...");
+        await dispatchDownloadJob(env, chatId, "copyright_check_run", { r2_key: inputKey });
       } else if (thread.flow === "toaudio") {
         if (!isVideo) {
           await sendMessage(env, chatId, "এটা তো ইতিমধ্যে audio ফাইল, কনভার্ট করার দরকার নেই।");
