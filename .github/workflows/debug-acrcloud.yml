@@ -1,0 +1,79 @@
+name: Debug ACRCloud Secrets
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check secret lengths and characters (safe, no full secret exposed)
+        env:
+          ACRCLOUD_ACCESS_KEY: ${{ secrets.ACRCLOUD_ACCESS_KEY }}
+          ACRCLOUD_ACCESS_SECRET: ${{ secrets.ACRCLOUD_ACCESS_SECRET }}
+          ACRCLOUD_HOST: ${{ secrets.ACRCLOUD_HOST }}
+        run: |
+          python3 << 'PYEOF'
+          import os
+
+          key = os.environ.get("ACRCLOUD_ACCESS_KEY", "")
+          secret = os.environ.get("ACRCLOUD_ACCESS_SECRET", "")
+          host = os.environ.get("ACRCLOUD_HOST", "")
+
+          def report(name, value):
+              print(f"--- {name} ---")
+              print(f"Length: {len(value)}")
+              print(f"First 5 chars: {repr(value[:5])}")
+              print(f"Last 5 chars: {repr(value[-5:])}")
+              print(f"Has leading whitespace: {value != value.lstrip()}")
+              print(f"Has trailing whitespace: {value != value.rstrip()}")
+              print(f"Has newline: {'\\n' in value}")
+              print()
+
+          report("ACCESS_KEY", key)
+          report("ACCESS_SECRET", secret)
+          report("HOST", host)
+          PYEOF
+
+      - name: Try an actual ACRCloud identify call with a silent test file
+        env:
+          ACRCLOUD_ACCESS_KEY: ${{ secrets.ACRCLOUD_ACCESS_KEY }}
+          ACRCLOUD_ACCESS_SECRET: ${{ secrets.ACRCLOUD_ACCESS_SECRET }}
+          ACRCLOUD_HOST: ${{ secrets.ACRCLOUD_HOST }}
+        run: |
+          pip install -U requests
+          sudo apt-get install -y ffmpeg
+          ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t 5 -ac 2 test.mp3
+
+          python3 << 'PYEOF'
+          import os, hmac, hashlib, base64, time, requests
+
+          access_key = os.environ["ACRCLOUD_ACCESS_KEY"].strip()
+          access_secret = os.environ["ACRCLOUD_ACCESS_SECRET"].strip()
+          host = os.environ["ACRCLOUD_HOST"].strip()
+
+          timestamp = str(int(time.time()))
+          string_to_sign = f"POST\n/v1/identify\n{access_key}\naudio\n1\n{timestamp}"
+          print(f"String to sign: {repr(string_to_sign)}")
+
+          signature = base64.b64encode(
+              hmac.new(access_secret.encode(), string_to_sign.encode(), hashlib.sha1).digest()
+          ).decode()
+          print(f"Signature: {signature}")
+
+          with open("test.mp3", "rb") as f:
+              sample_bytes = f.read()
+
+          files = {"sample": ("test.mp3", sample_bytes, "audio/mpeg")}
+          data = {
+              "access_key": access_key,
+              "sample_bytes": str(len(sample_bytes)),
+              "timestamp": timestamp,
+              "signature": signature,
+              "data_type": "audio",
+              "signature_version": "1",
+          }
+
+          resp = requests.post(f"https://{host}/v1/identify", data=data, files=files)
+          print(f"HTTP status: {resp.status_code}")
+          print(f"Response: {resp.text}")
+          PYEOF
