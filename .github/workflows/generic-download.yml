@@ -1,0 +1,55 @@
+name: Generic Video Download
+on:
+  repository_dispatch:
+    types: [generic_download]
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install deps
+        run: |
+          pip install -U --pre "yt-dlp[default]"
+          sudo apt-get install -y ffmpeg
+
+      - name: Download video
+        run: |
+          yt-dlp -o "video.%(ext)s" "${{ github.event.client_payload.url }}"
+          mv video.* input.mp4
+
+      - name: Send video to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -s -F "chat_id=${CHAT_ID}" -F "video=@input.mp4" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendVideo"
+
+      - name: Cache video in R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          JOB_ID="${{ github.event.client_payload.job_id }}"
+          aws s3 cp input.mp4 "s3://toolkits-assets/generic-cache/${JOB_ID}.mp4" --endpoint-url "$R2_ENDPOINT"
+
+      - name: Ask for audio conversion
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\": \"${CHAT_ID}\", \"text\": \"অডিও ভার্সন (MP3/WAV) লাগবে?\", \"reply_markup\": {\"inline_keyboard\": [[{\"text\": \"🎵 হ্যাঁ, Audio বানাও\", \"callback_data\": \"generic_audio:${JOB_ID}\"}]]}}"
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d text="দুঃখিত, এই লিংক থেকে ভিডিও ডাউনলোড করা যায়নি। এই ওয়েবসাইট সাপোর্ট নাও করতে পারে, অথবা লিংক ভুল/প্রাইভেট হতে পারে।"
