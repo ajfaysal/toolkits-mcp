@@ -1,26 +1,14 @@
-// LofiMellowBot Telegram Webhook Handler — v18
-// v2 fixes: pairs audio+video sent separately into one combined job.
-// v3 added: Facebook video downloader + MP3/WAV audio extraction.
-// v5 added: YouTube video downloader + MP3/WAV audio extraction.
-// v6 fixed: multiple links in one message all get downloaded.
-// v7 added: batch "convert all to audio" button for multi-link messages.
-// v8 added: /meta — metadata editor for user-uploaded files.
-// v9 added: after FB/YT audio conversion, bot asks "edit metadata or skip?".
-// v10 fixed metadata edit cross-contamination using Telegram force_reply threads.
-// v11 added: /trim — cuts a given second-range OUT of a file.
-// v12 added: X (Twitter) video downloader.
-// v13-v17 iterated a copyright checker (AudD, then ACRCloud) inside the Worker.
-// v18 moves the copyright check entirely into a GitHub Actions workflow
-// (copyright-check.yml), which uses ffmpeg to cut proper audio segments and
-// Python's HMAC library to sign requests to ACRCloud — avoiding the
-// "invalid signature" and "file too large" issues from the Worker-only
-// approach. The Worker now just dispatches the job and waits for the
-// workflow to message the user directly.
+// LofiMellowBot Telegram Webhook Handler — v19
+// v2-v18: see earlier version history (pairing loop, FB/YT/X downloaders,
+// /meta, /trim, /toaudio, /checkmusic via AudD).
+// v19 adds: (1) generic "any website" video downloader as a fallback when a
+// link doesn't match Facebook/YouTube/X — powered by yt-dlp, works on
+// Instagram/TikTok/Vimeo/etc; (2) an audio mastering button (loudness
+// normalization + light compression + EQ boost via ffmpeg) offered
+// alongside metadata-edit/copyright-check after any audio is produced.
 //
 // Bindings/secrets: TOOLKITS_BUCKET (R2), TELEGRAM_BOT_TOKEN, GITHUB_PAT,
 // GITHUB_OWNER, GITHUB_REPO, R2_PUBLIC_BASE_URL
-// (ACRCloud credentials now live as GitHub repo secrets, used only inside
-// copyright-check.yml — not needed by the Worker anymore.)
 
 export interface Env {
   TOOLKITS_BUCKET: R2Bucket;
@@ -31,7 +19,7 @@ export interface Env {
   R2_PUBLIC_BASE_URL: string;
 }
 
-type Platform = "fb" | "yt" | "x";
+type Platform = "fb" | "yt" | "x" | "generic";
 
 type PendingState = {
   type: "video" | "audio";
@@ -66,18 +54,21 @@ const PLATFORM_LABEL: Record<Platform, string> = {
   fb: "ফেসবুক",
   yt: "ইউটিউব",
   x: "এক্স (Twitter)",
+  generic: "এই ওয়েবসাইট",
 };
 
 const DOWNLOAD_EVENT: Record<Platform, string> = {
   fb: "fb_download",
   yt: "yt_download",
   x: "x_download",
+  generic: "generic_download",
 };
 
 const AUDIO_EVENT: Record<Platform, string> = {
   fb: "fb_audio",
   yt: "yt_audio",
   x: "x_audio",
+  generic: "generic_audio",
 };
 
 export default {
@@ -114,7 +105,7 @@ export default {
         "I'll wait for both and combine them into one seamless long loop. " +
         "Or send just one of them and type /skip to process it alone (video gets no audio, audio loops on its own). " +
         "Caption a file with a number (minutes) to set duration, default 120. " +
-        "\n\nYou can also paste one or more Facebook, YouTube, or X (Twitter) video links and I'll send each video back directly, with an option to convert one or all of them to MP3/WAV audio — and after the audio is ready, you'll get the option to edit its title/filename or check if it's already distributed elsewhere." +
+        "\n\nYou can also paste one or more Facebook, YouTube, X (Twitter), or any other video link — I'll send each video back directly, with options to convert to MP3/WAV, edit metadata, check copyright, or master the audio." +
         "\n\nType /meta to edit a file's title and filename yourself. Type /trim to cut a specific second-range out of a file. Type /checkmusic to upload an audio file and check if it matches an already-distributed track. Type /toaudio to upload a video and get it converted to MP3/WAV directly. " +
         "\n\nImportant: when I ask for a title, filename, or time range, always use Telegram's Reply on that exact message — this keeps multiple files from getting mixed up.");
       return new Response("ok");
@@ -211,9 +202,18 @@ export default {
       }
     }
 
+    // --- Generic fallback: any other website link (yt-dlp supported sites) ---
+    if (message.text) {
+      const genericUrls = Array.from(message.text.matchAll(/https?:\/\/\S+/g)).map((m: any) => m[0]);
+      if (genericUrls.length > 0) {
+        await handleMultiDownload(env, chatId, "generic", genericUrls);
+        return new Response("ok");
+      }
+    }
+
     const file = message.audio || message.video || message.document;
     if (!file) {
-      await sendMessage(env, chatId, "Please send an audio/video file, a Google Drive link for audio, or a Facebook/YouTube/X video link. Or type /meta, /trim, /checkmusic, or /toaudio.");
+      await sendMessage(env, chatId, "Please send an audio/video file, a Google Drive link for audio, or any video link. Or type /meta, /trim, /checkmusic, or /toaudio.");
       return new Response("ok");
     }
 
@@ -319,7 +319,7 @@ async function dispatchJob(env: Env, chatId: number, payload: Record<string, any
   }
 }
 
-// --- Downloader helpers (shared by Facebook, YouTube, X) ---
+// --- Downloader helpers (shared by Facebook, YouTube, X, generic) ---
 
 async function handleMultiDownload(env: Env, chatId: number, platform: Platform, urls: string[]) {
   const jobIds: string[] = [];
@@ -333,7 +333,7 @@ async function handleMultiDownload(env: Env, chatId: number, platform: Platform,
   }
 
   if (urls.length === 1) {
-    await sendMessage(env, chatId, `${platformLabel} ভিডিও ডাউনলোড হচ্ছে, একটু অপেক্ষা করো...`);
+    await sendMessage(env, chatId, `${platformLabel} থেকে ভিডিও ডাউনলোড হচ্ছে, একটু অপেক্ষা করো...`);
     return;
   }
 
@@ -341,7 +341,7 @@ async function handleMultiDownload(env: Env, chatId: number, platform: Platform,
   const batch: BatchState = { chat_id: chatId, platform, job_ids: jobIds };
   await env.TOOLKITS_BUCKET.put(`telegram-batch/${batchId}.json`, JSON.stringify(batch));
 
-  await sendMessage(env, chatId, `${urls.length}টা ${platformLabel} ভিডিও ডাউনলোড হচ্ছে, একটু অপেক্ষা করো...`);
+  await sendMessage(env, chatId, `${urls.length}টা ভিডিও ডাউনলোড হচ্ছে, একটু অপেক্ষা করো...`);
 
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
@@ -380,6 +380,10 @@ async function handleCallbackQuery(env: Env, callbackQuery: any) {
     const jobId = data.replace("x_audio:", "");
     await dispatchDownloadJob(env, chatId, "x_audio", { job_id: jobId });
     await sendMessage(env, chatId, "অডিও (MP3/WAV) বানানো হচ্ছে...");
+  } else if (data.startsWith("generic_audio:")) {
+    const jobId = data.replace("generic_audio:", "");
+    await dispatchDownloadJob(env, chatId, "generic_audio", { job_id: jobId });
+    await sendMessage(env, chatId, "অডিও (MP3/WAV) বানানো হচ্ছে...");
   } else if (data.startsWith("batch_audio:")) {
     const batchId = data.replace("batch_audio:", "");
     const obj = await env.TOOLKITS_BUCKET.get(`telegram-batch/${batchId}.json`);
@@ -405,8 +409,12 @@ async function handleCallbackQuery(env: Env, callbackQuery: any) {
     await sendMessage(env, chatId, "ঠিক আছে, আগের ভার্সনটাই final থাকলো।");
   } else if (data.startsWith("copyright_check:")) {
     const jobId = data.replace("copyright_check:", "");
-    await sendMessage(env, chatId, "কপিরাইট/ডিস্ট্রিবিউশন চেক করা হচ্ছে, একটু অপেক্ষা করো (৪টা অংশ চেক হবে, সময় লাগবে)...");
+    await sendMessage(env, chatId, "কপিরাইট/ডিস্ট্রিবিউশন চেক করা হচ্ছে, একটু অপেক্ষা করো...");
     await dispatchDownloadJob(env, chatId, "copyright_check_run", { r2_key: `audio-cache/${jobId}.mp3` });
+  } else if (data.startsWith("audio_master:")) {
+    const jobId = data.replace("audio_master:", "");
+    await sendMessage(env, chatId, "অডিও মাস্টারিং (লাউডনেস/কোয়ালিটি বুস্ট) করা হচ্ছে, একটু অপেক্ষা করো...");
+    await dispatchDownloadJob(env, chatId, "audio_master_run", { r2_key: `audio-cache/${jobId}.mp3` });
   }
 }
 
@@ -475,7 +483,7 @@ async function handleThreadReply(env: Env, chatId: number, message: any, replied
           await sendMessage(env, chatId, "এটা video ফাইল মনে হচ্ছে। /checkmusic শুধু audio ফাইলের জন্য — audio (mp3/wav) পাঠাও।");
           return true;
         }
-        await sendMessage(env, chatId, "কপিরাইট/ডিস্ট্রিবিউশন চেক করা হচ্ছে, একটু অপেক্ষা করো (৪টা অংশ চেক হবে, সময় লাগবে)...");
+        await sendMessage(env, chatId, "কপিরাইট/ডিস্ট্রিবিউশন চেক করা হচ্ছে, একটু অপেক্ষা করো...");
         await dispatchDownloadJob(env, chatId, "copyright_check_run", { r2_key: inputKey });
       } else if (thread.flow === "toaudio") {
         if (!isVideo) {
