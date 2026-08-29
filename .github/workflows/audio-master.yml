@@ -1,0 +1,44 @@
+name: Audio Mastering
+on:
+  repository_dispatch:
+    types: [audio_master_run]
+
+jobs:
+  master:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install ffmpeg
+        run: sudo apt-get install -y ffmpeg
+
+      - name: Pull audio from R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          R2_KEY="${{ github.event.client_payload.r2_key }}"
+          aws s3 cp "s3://toolkits-assets/${R2_KEY}" input.mp3 --endpoint-url "$R2_ENDPOINT"
+
+      - name: Master the audio (loudness normalize + light compression + EQ boost)
+        run: |
+          ffmpeg -y -i input.mp3 -af \
+            "loudnorm=I=-14:TP=-1:LRA=11,acompressor=threshold=-18dB:ratio=3:attack=5:release=50,equalizer=f=100:width_type=o:width=2:g=2,equalizer=f=8000:width_type=o:width=2:g=2" \
+            -b:a 320k mastered.mp3
+
+      - name: Send mastered audio to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -s -F "chat_id=${CHAT_ID}" -F "audio=@mastered.mp3;filename=mastered.mp3" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendAudio"
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d text="দুঃখিত, অডিও মাস্টারিং করা যায়নি।"
