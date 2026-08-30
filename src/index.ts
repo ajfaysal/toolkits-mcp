@@ -1,11 +1,13 @@
-// LofiMellowBot Telegram Webhook Handler — v19
+// LofiMellowBot Telegram Webhook Handler — v20
 // v2-v18: see earlier version history (pairing loop, FB/YT/X downloaders,
 // /meta, /trim, /toaudio, /checkmusic via AudD).
-// v19 adds: (1) generic "any website" video downloader as a fallback when a
+// v19 added: (1) generic "any website" video downloader as a fallback when a
 // link doesn't match Facebook/YouTube/X — powered by yt-dlp, works on
 // Instagram/TikTok/Vimeo/etc; (2) an audio mastering button (loudness
 // normalization + light compression + EQ boost via ffmpeg) offered
 // alongside metadata-edit/copyright-check after any audio is produced.
+// v20 adds: /master standalone command — upload an audio file directly
+// and get it mastered without going through a download flow first.
 //
 // Bindings/secrets: TOOLKITS_BUCKET (R2), TELEGRAM_BOT_TOKEN, GITHUB_PAT,
 // GITHUB_OWNER, GITHUB_REPO, R2_PUBLIC_BASE_URL
@@ -36,7 +38,7 @@ type BatchState = {
 };
 
 type ReplyThread = {
-  flow: "meta" | "trim" | "checkmusic" | "toaudio";
+  flow: "meta" | "trim" | "checkmusic" | "toaudio" | "master";
   stage: "awaiting_file" | "awaiting_title" | "awaiting_filename" | "awaiting_range";
   source?: "upload" | "cached";
   input_key?: string;
@@ -106,7 +108,7 @@ export default {
         "Or send just one of them and type /skip to process it alone (video gets no audio, audio loops on its own). " +
         "Caption a file with a number (minutes) to set duration, default 120. " +
         "\n\nYou can also paste one or more Facebook, YouTube, X (Twitter), or any other video link — I'll send each video back directly, with options to convert to MP3/WAV, edit metadata, check copyright, or master the audio." +
-        "\n\nType /meta to edit a file's title and filename yourself. Type /trim to cut a specific second-range out of a file. Type /checkmusic to upload an audio file and check if it matches an already-distributed track. Type /toaudio to upload a video and get it converted to MP3/WAV directly. " +
+        "\n\nType /meta to edit a file's title and filename yourself. Type /trim to cut a specific second-range out of a file. Type /checkmusic to upload an audio file and check if it matches an already-distributed track. Type /toaudio to upload a video and get it converted to MP3/WAV directly. Type /master to upload an audio file and get it mastered (loudness/quality boost) directly. " +
         "\n\nImportant: when I ask for a title, filename, or time range, always use Telegram's Reply on that exact message — this keeps multiple files from getting mixed up.");
       return new Response("ok");
     }
@@ -164,6 +166,15 @@ export default {
       return new Response("ok");
     }
 
+    if (message.text?.trim() === "/master") {
+      const messageId = await sendForceReply(env, chatId, "যে অডিওটা মাস্টারিং করতে চাও সেটা পাঠাও — এই মেসেজে Reply করে পাঠাও।");
+      if (messageId) {
+        const thread: ReplyThread = { flow: "master", stage: "awaiting_file", timestamp: Date.now() };
+        await env.TOOLKITS_BUCKET.put(`telegram-editthread/${chatId}-${messageId}.json`, JSON.stringify(thread));
+      }
+      return new Response("ok");
+    }
+
     // --- Facebook video link handling ---
     if (message.text && (message.text.includes("facebook.com") || message.text.includes("fb.watch"))) {
       const urls = Array.from(message.text.matchAll(/https?:\/\/\S+/g)).map((m: any) => m[0]);
@@ -213,7 +224,7 @@ export default {
 
     const file = message.audio || message.video || message.document;
     if (!file) {
-      await sendMessage(env, chatId, "Please send an audio/video file, a Google Drive link for audio, or any video link. Or type /meta, /trim, /checkmusic, or /toaudio.");
+      await sendMessage(env, chatId, "Please send an audio/video file, a Google Drive link for audio, or any video link. Or type /meta, /trim, /checkmusic, /toaudio, or /master.");
       return new Response("ok");
     }
 
@@ -418,7 +429,7 @@ async function handleCallbackQuery(env: Env, callbackQuery: any) {
   }
 }
 
-// --- Reply-thread handling (shared by /meta, /trim, /checkmusic, /toaudio) ---
+// --- Reply-thread handling (shared by /meta, /trim, /checkmusic, /toaudio, /master) ---
 
 async function handleThreadReply(env: Env, chatId: number, message: any, repliedToMessageId: number): Promise<boolean> {
   const key = `telegram-editthread/${chatId}-${repliedToMessageId}.json`;
@@ -493,6 +504,13 @@ async function handleThreadReply(env: Env, chatId: number, message: any, replied
         const jobId = crypto.randomUUID();
         await dispatchDownloadJob(env, chatId, "video_to_audio", { input_key: inputKey, ext, job_id: jobId });
         await sendMessage(env, chatId, "ভিডিও থেকে অডিও বানানো হচ্ছে, একটু অপেক্ষা করো...");
+      } else if (thread.flow === "master") {
+        if (isVideo) {
+          await sendMessage(env, chatId, "এটা video ফাইল মনে হচ্ছে। শুধু audio ফাইল পাঠাও।");
+          return true;
+        }
+        await sendMessage(env, chatId, "অডিও মাস্টারিং হচ্ছে, একটু অপেক্ষা করো...");
+        await dispatchDownloadJob(env, chatId, "audio_master_run", { r2_key: inputKey });
       }
     } catch (err: any) {
       await sendMessage(env, chatId, "Something went wrong: " + err.message);
