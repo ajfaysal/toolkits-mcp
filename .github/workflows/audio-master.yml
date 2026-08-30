@@ -19,11 +19,34 @@ jobs:
           R2_KEY="${{ github.event.client_payload.r2_key }}"
           aws s3 cp "s3://toolkits-assets/${R2_KEY}" input.mp3 --endpoint-url "$R2_ENDPOINT"
 
-      - name: Master the audio (loudness normalize + light compression + EQ boost)
+      - name: Pass 1 - measure loudness
         run: |
+          ffmpeg -y -i input.mp3 -af loudnorm=I=-11:TP=-1:LRA=9:print_format=json -f null - 2> loudnorm_stats.txt
+          cat loudnorm_stats.txt
+
+      - name: Master the audio (punchy EQ + compression + stereo enhance + limiter)
+        run: |
+          MEASURED_I=$(grep -A 20 "\[Parsed_loudnorm" loudnorm_stats.txt | grep '"input_i"' | sed -E 's/.*: *"?(-?[0-9.]+)"?,?/\1/')
+          MEASURED_TP=$(grep -A 20 "\[Parsed_loudnorm" loudnorm_stats.txt | grep '"input_tp"' | sed -E 's/.*: *"?(-?[0-9.]+)"?,?/\1/')
+          MEASURED_LRA=$(grep -A 20 "\[Parsed_loudnorm" loudnorm_stats.txt | grep '"input_lra"' | sed -E 's/.*: *"?(-?[0-9.]+)"?,?/\1/')
+          MEASURED_THRESH=$(grep -A 20 "\[Parsed_loudnorm" loudnorm_stats.txt | grep '"input_thresh"' | sed -E 's/.*: *"?(-?[0-9.]+)"?,?/\1/')
+
+          echo "Measured: I=$MEASURED_I TP=$MEASURED_TP LRA=$MEASURED_LRA THRESH=$MEASURED_THRESH"
+
           ffmpeg -y -i input.mp3 -af \
-            "loudnorm=I=-14:TP=-1:LRA=11,acompressor=threshold=-18dB:ratio=3:attack=5:release=50,equalizer=f=100:width_type=o:width=2:g=2,equalizer=f=8000:width_type=o:width=2:g=2" \
-            -b:a 320k mastered.mp3
+            "highpass=f=30, \
+             equalizer=f=65:width_type=o:width=1.4:g=3, \
+             equalizer=f=250:width_type=o:width=1.5:g=-1.5, \
+             equalizer=f=1000:width_type=o:width=1.5:g=0.8, \
+             equalizer=f=3000:width_type=o:width=1.4:g=2.5, \
+             equalizer=f=6000:width_type=o:width=1.4:g=1.5, \
+             equalizer=f=12000:width_type=o:width=1.4:g=2.2, \
+             acompressor=threshold=-18dB:ratio=2.8:attack=6:release=90:makeup=2.5, \
+             stereotools=slev=1.25, \
+             aexciter=level_in=1:level_out=1:amount=2.2:drive=10:blend=0.3, \
+             loudnorm=I=-11:TP=-1:LRA=9:measured_I=${MEASURED_I}:measured_TP=${MEASURED_TP}:measured_LRA=${MEASURED_LRA}:measured_thresh=${MEASURED_THRESH}:linear=true, \
+             alimiter=limit=0.97:attack=2:release=40" \
+            -ar 44100 -b:a 320k mastered.mp3
 
       - name: Send mastered audio to Telegram
         env:
