@@ -47,7 +47,7 @@ jobs:
           aws s3 cp output.mp3 "s3://toolkits-assets/audio-cache/${JOB_ID}.mp3" --endpoint-url "$R2_ENDPOINT"
           aws s3 cp output.wav "s3://toolkits-assets/audio-cache/${JOB_ID}.wav" --endpoint-url "$R2_ENDPOINT"
 
-      - name: Ask about metadata edit and copyright check
+      - name: Ask about metadata edit, copyright check, and mastering
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ github.event.client_payload.chat_id }}
@@ -55,7 +55,7 @@ jobs:
         run: |
           curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -H "Content-Type: application/json" \
-            -d "{\"chat_id\": \"${CHAT_ID}\", \"text\": \"এই অডিওর Title/Metadata এডিট করবে, নাকি কপিরাইট চেক করবে?\", \"reply_markup\": {\"inline_keyboard\": [[{\"text\": \"✏️ এডিট করো\", \"callback_data\": \"dlmeta_edit:${JOB_ID}\"}, {\"text\": \"✅ থাক, স্কিপ\", \"callback_data\": \"dlmeta_skip:${JOB_ID}\"}],[{\"text\": \"🔍 কপিরাইট চেক করো\", \"callback_data\": \"copyright_check:${JOB_ID}\"}]]}}"
+            -d "{\"chat_id\": \"${CHAT_ID}\", \"text\": \"এই অডিওর Title/Metadata এডিট করবে, কপিরাইট চেক করবে, নাকি মাস্টারিং করবে?\", \"reply_markup\": {\"inline_keyboard\": [[{\"text\": \"✏️ এডিট করো\", \"callback_data\": \"dlmeta_edit:${JOB_ID}\"}, {\"text\": \"✅ থাক, স্কিপ\", \"callback_data\": \"dlmeta_skip:${JOB_ID}\"}],[{\"text\": \"🔍 কপিরাইট চেক করো\", \"callback_data\": \"copyright_check:${JOB_ID}\"}],[{\"text\": \"🎚️ Audio Mastering করো\", \"callback_data\": \"audio_master:${JOB_ID}\"}]]}}"
 
       - name: Cleanup R2 input
         env:
