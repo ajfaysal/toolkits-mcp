@@ -10,12 +10,31 @@ jobs:
       - name: Install deps
         run: |
           pip install -U --pre "yt-dlp[default]"
-          sudo apt-get install -y ffmpeg
+          for i in 1 2 3; do
+            sudo apt-get update -qq && sudo apt-get install -y ffmpeg && break
+            echo "Retry $i failed, waiting 10s..."
+            sleep 10
+          done
 
       - name: Download video
         run: |
-          yt-dlp -o "video.%(ext)s" "${{ github.event.client_payload.url }}"
-          mv video.* input.mp4
+          set -euo pipefail
+          URL="${{ github.event.client_payload.url }}"
+
+          yt-dlp --no-playlist --retries 6 --fragment-retries 6 \
+            --no-write-thumbnail --no-write-info-json \
+            --merge-output-format mp4 \
+            -o "video.%(ext)s" "$URL"
+
+          shopt -s nullglob
+          FILES=(video.*)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "No downloaded file found"
+            exit 1
+          fi
+
+          ffmpeg -y -i "${FILES[0]}" -movflags +faststart -c copy input.mp4 || \
+          ffmpeg -y -i "${FILES[0]}" -movflags +faststart -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k input.mp4
 
       - name: Send video to Telegram
         env:

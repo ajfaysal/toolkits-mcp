@@ -1,0 +1,54 @@
+name: MP3 to WAV Converter
+on:
+  repository_dispatch:
+    types: [mp3_to_wav]
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y ffmpeg
+
+      - name: Pull uploaded audio from R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          INPUT_KEY="${{ github.event.client_payload.input_key }}"
+          EXT="${{ github.event.client_payload.ext }}"
+          aws s3 cp "s3://toolkits-assets/${INPUT_KEY}" "input.${EXT}" --endpoint-url "$R2_ENDPOINT"
+
+      - name: Convert to WAV
+        env:
+          EXT: ${{ github.event.client_payload.ext }}
+        run: |
+          ffmpeg -y -i "input.${EXT}" -acodec pcm_s16le -ar 44100 output.wav
+
+      - name: Send WAV to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -s -F "chat_id=${CHAT_ID}" -F "document=@output.wav;filename=converted.wav" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument"
+
+      - name: Cleanup R2 input
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          INPUT_KEY="${{ github.event.client_payload.input_key }}"
+          aws s3 rm "s3://toolkits-assets/${INPUT_KEY}" --endpoint-url "$R2_ENDPOINT" || true
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d text="দুঃখিত, MP3 থেকে WAV কনভার্ট করা যায়নি। আবার /mp3towav দিয়ে চেষ্টা করো।"

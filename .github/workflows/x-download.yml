@@ -56,14 +56,30 @@ jobs:
           ydl_opts = {
               "outtmpl": "video.%(ext)s",
               "progress_hooks": [progress_hook],
+              "noplaylist": True,
+              "retries": 6,
+              "fragment_retries": 6,
+              "merge_output_format": "mp4",
+              "writethumbnail": False,
+              "writeinfojson": False,
           }
 
           with yt_dlp.YoutubeDL(ydl_opts) as ydl:
               ydl.download([video_url])
           PYEOF
 
-      - name: Normalize output filename
-        run: mv video.* input.mp4
+      - name: Normalize output file to MP4
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          FILES=(video.*)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "No downloaded file found"
+            exit 1
+          fi
+
+          ffmpeg -y -i "${FILES[0]}" -movflags +faststart -c copy input.mp4 || \
+          ffmpeg -y -i "${FILES[0]}" -movflags +faststart -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k input.mp4
 
       - name: Send video to Telegram
         env:
