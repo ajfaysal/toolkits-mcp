@@ -20,13 +20,21 @@ jobs:
         run: |
           set -euo pipefail
           URL="${{ github.event.client_payload.url }}"
+          dl_try() {
+            local format="$1"
+            local clients="$2"
+            yt-dlp --no-playlist --retries 10 --fragment-retries 10 --extractor-retries 5 \
+              --socket-timeout 25 --concurrent-fragments 4 \
+              --no-write-thumbnail --no-write-info-json \
+              --extractor-args "youtube:player_client=${clients}" \
+              --format "${format}" \
+              --merge-output-format mp4 \
+              -o "video.%(ext)s" "$URL"
+          }
 
-          yt-dlp --no-playlist --retries 8 --fragment-retries 8 \
-            --no-write-thumbnail --no-write-info-json \
-            --extractor-args "youtube:player_client=android,web,ios,mweb" \
-            --format "bv*+ba/b" \
-            --merge-output-format mp4 \
-            -o "video.%(ext)s" "$URL"
+          dl_try "bv*+ba/b" "android,web,ios,mweb" || \
+          dl_try "bestvideo+bestaudio/best" "web,mweb,android" || \
+          dl_try "best" "web"
 
           shopt -s nullglob
           FILES=(video.*)
