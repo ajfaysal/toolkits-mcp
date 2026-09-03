@@ -10,7 +10,11 @@ jobs:
       - name: Install deps
         run: |
           pip install -U --pre "yt-dlp[default]"
-          sudo apt-get install -y ffmpeg
+          for i in 1 2 3; do
+            sudo apt-get update -qq && sudo apt-get install -y ffmpeg && break
+            echo "Retry $i failed, waiting 10s..."
+            sleep 10
+          done
 
       - name: Download FB video
         run: |
