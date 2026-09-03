@@ -10,15 +10,41 @@ jobs:
       - name: Install deps
         run: |
           pip install -U --pre "yt-dlp[default]"
-          sudo apt-get install -y ffmpeg
-          curl -fsSL https://deno.land/install.sh | sh
-          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+          for i in 1 2 3; do
+            sudo apt-get update -qq && sudo apt-get install -y ffmpeg && break
+            echo "Retry $i failed, waiting 10s..."
+            sleep 10
+          done
 
       - name: Download YouTube video
         run: |
-          yt-dlp --extractor-args "youtube:player_client=android,web" \
-            -o "video.%(ext)s" "${{ github.event.client_payload.url }}"
-          mv video.* input.mp4
+          set -euo pipefail
+          URL="${{ github.event.client_payload.url }}"
+          dl_try() {
+            local format="$1"
+            local clients="$2"
+            yt-dlp --no-playlist --retries 10 --fragment-retries 10 --extractor-retries 5 \
+              --socket-timeout 25 --concurrent-fragments 4 \
+              --no-write-thumbnail --no-write-info-json \
+              --extractor-args "youtube:player_client=${clients}" \
+              --format "${format}" \
+              --merge-output-format mp4 \
+              -o "video.%(ext)s" "$URL"
+          }
+
+          dl_try "bv*+ba/b" "android,web,ios,mweb" || \
+          dl_try "bestvideo+bestaudio/best" "web,mweb,android" || \
+          dl_try "best" "web"
+
+          shopt -s nullglob
+          FILES=(video.*)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "No downloaded file found"
+            exit 1
+          fi
+
+          ffmpeg -y -i "${FILES[0]}" -movflags +faststart -c copy input.mp4 || \
+          ffmpeg -y -i "${FILES[0]}" -movflags +faststart -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k input.mp4
 
       - name: Send video to Telegram
         env:

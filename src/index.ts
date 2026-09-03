@@ -1,4 +1,4 @@
-// LofiMellowBot Telegram Webhook Handler — v20
+// LofiMellowBot Telegram Webhook Handler — v21
 // v2-v18: see earlier version history (pairing loop, FB/YT/X downloaders,
 // /meta, /trim, /toaudio, /checkmusic via AudD).
 // v19 added: (1) generic "any website" video downloader as a fallback when a
@@ -6,8 +6,9 @@
 // Instagram/TikTok/Vimeo/etc; (2) an audio mastering button (loudness
 // normalization + light compression + EQ boost via ffmpeg) offered
 // alongside metadata-edit/copyright-check after any audio is produced.
-// v20 adds: /master standalone command — upload an audio file directly
+// v20 added: /master standalone command — upload an audio file directly
 // and get it mastered without going through a download flow first.
+// v21 adds: /mp3towav standalone command for direct audio format conversion.
 //
 // Bindings/secrets: TOOLKITS_BUCKET (R2), TELEGRAM_BOT_TOKEN, GITHUB_PAT,
 // GITHUB_OWNER, GITHUB_REPO, R2_PUBLIC_BASE_URL
@@ -38,7 +39,7 @@ type BatchState = {
 };
 
 type ReplyThread = {
-  flow: "meta" | "trim" | "checkmusic" | "toaudio" | "master";
+  flow: "meta" | "trim" | "checkmusic" | "toaudio" | "master" | "mp3towav";
   stage: "awaiting_file" | "awaiting_title" | "awaiting_filename" | "awaiting_range";
   source?: "upload" | "cached";
   input_key?: string;
@@ -108,7 +109,7 @@ export default {
         "Or send just one of them and type /skip to process it alone (video gets no audio, audio loops on its own). " +
         "Caption a file with a number (minutes) to set duration, default 120. " +
         "\n\nYou can also paste one or more Facebook, YouTube, X (Twitter), or any other video link — I'll send each video back directly, with options to convert to MP3/WAV, edit metadata, check copyright, or master the audio." +
-        "\n\nType /meta to edit a file's title and filename yourself. Type /trim to cut a specific second-range out of a file. Type /checkmusic to upload an audio file and check if it matches an already-distributed track. Type /toaudio to upload a video and get it converted to MP3/WAV directly. Type /master to upload an audio file and get it mastered (loudness/quality boost) directly. " +
+        "\n\nType /meta to edit a file's title and filename yourself. Type /trim to cut a specific second-range out of a file. Type /checkmusic to upload an audio file and check if it matches an already-distributed track. Type /toaudio to upload a video and get it converted to MP3/WAV directly. Type /master to upload an audio file and get it mastered (loudness/quality boost) directly. Type /mp3towav to upload an MP3 and convert it to WAV. " +
         "\n\nImportant: when I ask for a title, filename, or time range, always use Telegram's Reply on that exact message — this keeps multiple files from getting mixed up.");
       return new Response("ok");
     }
@@ -175,6 +176,15 @@ export default {
       return new Response("ok");
     }
 
+    if (message.text?.trim() === "/mp3towav") {
+      const messageId = await sendForceReply(env, chatId, "যে MP3 ফাইলটা WAV করতে চাও সেটা পাঠাও — এই মেসেজে Reply করে পাঠাও।");
+      if (messageId) {
+        const thread: ReplyThread = { flow: "mp3towav", stage: "awaiting_file", timestamp: Date.now() };
+        await env.TOOLKITS_BUCKET.put(`telegram-editthread/${chatId}-${messageId}.json`, JSON.stringify(thread));
+      }
+      return new Response("ok");
+    }
+
     // --- Facebook video link handling ---
     if (message.text && (message.text.includes("facebook.com") || message.text.includes("fb.watch"))) {
       const urls = Array.from(message.text.matchAll(/https?:\/\/\S+/g)).map((m: any) => m[0]);
@@ -224,7 +234,7 @@ export default {
 
     const file = message.audio || message.video || message.document;
     if (!file) {
-      await sendMessage(env, chatId, "Please send an audio/video file, a Google Drive link for audio, or any video link. Or type /meta, /trim, /checkmusic, /toaudio, or /master.");
+      await sendMessage(env, chatId, "Please send an audio/video file, a Google Drive link for audio, or any video link. Or type /meta, /trim, /checkmusic, /toaudio, /master, or /mp3towav.");
       return new Response("ok");
     }
 
@@ -242,7 +252,7 @@ export default {
 
       const telegramFileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`;
       const fileBytes = await (await fetch(telegramFileUrl)).arrayBuffer();
-      const ext = isVideo ? "mp4" : "mp3";
+      const ext = inferStoredExtension(file, fileInfo.result.file_path, isVideo);
       const inputKey = `telegram-inputs/${chatId}-${Date.now()}.${ext}`;
       await env.TOOLKITS_BUCKET.put(inputKey, fileBytes);
 
@@ -429,7 +439,7 @@ async function handleCallbackQuery(env: Env, callbackQuery: any) {
   }
 }
 
-// --- Reply-thread handling (shared by /meta, /trim, /checkmusic, /toaudio, /master) ---
+// --- Reply-thread handling (shared by /meta, /trim, /checkmusic, /toaudio, /master, /mp3towav) ---
 
 async function handleThreadReply(env: Env, chatId: number, message: any, repliedToMessageId: number): Promise<boolean> {
   const key = `telegram-editthread/${chatId}-${repliedToMessageId}.json`;
@@ -465,7 +475,7 @@ async function handleThreadReply(env: Env, chatId: number, message: any, replied
       }
       const telegramFileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`;
       const fileBytes = await (await fetch(telegramFileUrl)).arrayBuffer();
-      const ext = isVideo ? "mp4" : "mp3";
+      const ext = inferStoredExtension(file, fileInfo.result.file_path, isVideo);
       const inputKey = `telegram-inputs/${chatId}-${Date.now()}.${ext}`;
       await env.TOOLKITS_BUCKET.put(inputKey, fileBytes);
       await env.TOOLKITS_BUCKET.delete(key);
@@ -511,6 +521,13 @@ async function handleThreadReply(env: Env, chatId: number, message: any, replied
         }
         await sendMessage(env, chatId, "অডিও মাস্টারিং হচ্ছে, একটু অপেক্ষা করো...");
         await dispatchDownloadJob(env, chatId, "audio_master_run", { r2_key: inputKey });
+      } else if (thread.flow === "mp3towav") {
+        if (isVideo) {
+          await sendMessage(env, chatId, "এটা video ফাইল মনে হচ্ছে। /mp3towav শুধু audio ফাইলের জন্য।");
+          return true;
+        }
+        await sendMessage(env, chatId, "MP3 থেকে WAV কনভার্ট হচ্ছে, একটু অপেক্ষা করো...");
+        await dispatchDownloadJob(env, chatId, "mp3_to_wav", { input_key: inputKey, ext });
       }
     } catch (err: any) {
       await sendMessage(env, chatId, "Something went wrong: " + err.message);
@@ -630,4 +647,28 @@ async function sendForceReply(env: Env, chatId: number, text: string): Promise<n
   } catch {
     return null;
   }
+}
+
+function inferStoredExtension(file: any, filePath: string | undefined, isVideo: boolean): string {
+  const mime = (file?.mime_type || "").toLowerCase();
+  const pathExt = ((filePath || "").split(".").pop() || "").toLowerCase();
+
+  const audioExts = new Set(["mp3", "wav", "m4a", "aac", "ogg", "opus", "flac"]);
+  const videoExts = new Set(["mp4", "mov", "mkv", "webm", "m4v", "avi"]);
+
+  if (isVideo) {
+    if (videoExts.has(pathExt)) return pathExt;
+    if (mime.includes("webm")) return "webm";
+    if (mime.includes("quicktime")) return "mov";
+    if (mime.includes("x-matroska")) return "mkv";
+    return "mp4";
+  }
+
+  if (audioExts.has(pathExt)) return pathExt;
+  if (mime.includes("wav")) return "wav";
+  if (mime.includes("ogg")) return "ogg";
+  if (mime.includes("aac")) return "aac";
+  if (mime.includes("mp4") || mime.includes("m4a")) return "m4a";
+  if (mime.includes("flac")) return "flac";
+  return "mp3";
 }

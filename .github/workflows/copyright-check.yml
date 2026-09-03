@@ -8,7 +8,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install deps
-        run: pip install -U requests
+        run: |
+          pip install -U requests
+          sudo apt-get update -qq && sudo apt-get install -y ffmpeg
 
       - name: Pull audio from R2
         env:
@@ -19,16 +21,26 @@ jobs:
           R2_KEY="${{ github.event.client_payload.r2_key }}"
           aws s3 cp "s3://toolkits-assets/${R2_KEY}" input_raw --endpoint-url "$R2_ENDPOINT"
 
-      - name: Identify via AudD and report to Telegram
+      - name: Normalize input for fingerprinting
+        run: |
+          ffmpeg -y -i input_raw -t 35 -vn -ac 1 -ar 16000 sample.wav
+
+      - name: Identify via ACRCloud + AudD and report to Telegram
         env:
+          ACRCLOUD_ACCESS_KEY: ${{ secrets.ACRCLOUD_ACCESS_KEY }}
+          ACRCLOUD_ACCESS_SECRET: ${{ secrets.ACRCLOUD_ACCESS_SECRET }}
+          ACRCLOUD_HOST: ${{ secrets.ACRCLOUD_HOST }}
           AUDD_API_TOKEN: ${{ secrets.AUDD_API_TOKEN }}
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ github.event.client_payload.chat_id }}
         run: |
           python3 << 'PYEOF'
-          import os, requests
+          import os, requests, time, hmac, hashlib, base64
 
-          api_token = os.environ["AUDD_API_TOKEN"]
+          acr_key = os.environ.get("ACRCLOUD_ACCESS_KEY", "").strip()
+          acr_secret = os.environ.get("ACRCLOUD_ACCESS_SECRET", "").strip()
+          acr_host = os.environ.get("ACRCLOUD_HOST", "").strip()
+          api_token = os.environ.get("AUDD_API_TOKEN", "").strip()
           bot_token = os.environ["BOT_TOKEN"]
           chat_id = os.environ["CHAT_ID"]
 
@@ -38,48 +50,133 @@ jobs:
                   data={"chat_id": chat_id, "text": text},
               )
 
-          with open("input_raw", "rb") as f:
-              files = {"file": ("audio.mp3", f, "audio/mpeg")}
-              data = {"api_token": api_token, "return": "spotify,apple_music,deezer"}
-              resp = requests.post("https://api.audd.io/", data=data, files=files)
+          def acrcloud_lookup():
+              if not (acr_key and acr_secret and acr_host):
+                  return {"provider": "ACRCloud", "status": "skipped", "reason": "missing_secrets"}
+              try:
+                  with open("sample.wav", "rb") as f:
+                      sample_bytes = f.read()
 
-          result = resp.json()
-          print(result)
+                  timestamp = str(int(time.time()))
+                  to_sign = f"POST\n/v1/identify\n{acr_key}\naudio\n1\n{timestamp}"
+                  signature = base64.b64encode(
+                      hmac.new(acr_secret.encode(), to_sign.encode(), hashlib.sha1).digest()
+                  ).decode()
 
-          if result.get("status") != "success":
-              err = result.get("error", {}).get("error_message", "unknown error")
-              send_message(f"চেক করতে সমস্যা হয়েছে: {err}")
-          elif not result.get("result"):
-              send_message(
-                  "✅ কোনো ম্যাচ পাওয়া যায়নি — এই exact অডিওটা AudD-এর ডাটাবেজে থাকা কোনো distributed track-এর সাথে মেলেনি।\n\n"
-                  "⚠️ মনে রাখবে: বাংলা/আঞ্চলিক গানের ক্ষেত্রে coverage কম হতে পারে, তাই এটা 100% guarantee না যে গানটা সম্পূর্ণ unreleased।"
+                  files = {"sample": ("sample.wav", sample_bytes, "audio/wav")}
+                  data = {
+                      "access_key": acr_key,
+                      "sample_bytes": str(len(sample_bytes)),
+                      "timestamp": timestamp,
+                      "signature": signature,
+                      "data_type": "audio",
+                      "signature_version": "1",
+                  }
+                  resp = requests.post(f"https://{acr_host}/v1/identify", data=data, files=files, timeout=40)
+                  payload = resp.json()
+                  status = payload.get("status", {})
+                  if status.get("code") != 0:
+                      return {"provider": "ACRCloud", "status": "error", "reason": status.get("msg", "unknown")}
+                  music = (payload.get("metadata", {}) or {}).get("music", []) or []
+                  if not music:
+                      return {"provider": "ACRCloud", "status": "no_match"}
+                  top = music[0]
+                  platforms = []
+                  external = top.get("external_metadata", {}) or {}
+                  spotify = (external.get("spotify", {}) or {}).get("track", {}) or {}
+                  youtube = (external.get("youtube", {}) or {}).get("vid")
+                  deezer = (external.get("deezer", {}) or {}).get("track", {}) or {}
+                  if spotify.get("id"):
+                      platforms.append(f"🎧 Spotify: https://open.spotify.com/track/{spotify['id']}")
+                  if deezer.get("id"):
+                      platforms.append(f"🎵 Deezer: https://www.deezer.com/track/{deezer['id']}")
+                  if youtube:
+                      platforms.append(f"▶️ YouTube: https://www.youtube.com/watch?v={youtube}")
+                  return {
+                      "provider": "ACRCloud",
+                      "status": "matched",
+                      "title": top.get("title", "N/A"),
+                      "artist": ", ".join([a.get("name", "") for a in (top.get("artists") or []) if a.get("name")]) or "N/A",
+                      "album": (top.get("album") or {}).get("name"),
+                      "release_date": top.get("release_date"),
+                      "label": top.get("label"),
+                      "platforms": platforms,
+                  }
+              except Exception as e:
+                  return {"provider": "ACRCloud", "status": "error", "reason": str(e)}
+
+          def audd_lookup():
+              if not api_token:
+                  return {"provider": "AudD", "status": "skipped", "reason": "missing_secret"}
+              try:
+                  with open("sample.wav", "rb") as f:
+                      files = {"file": ("sample.wav", f, "audio/wav")}
+                      data = {"api_token": api_token, "return": "spotify,apple_music,deezer"}
+                      resp = requests.post("https://api.audd.io/", data=data, files=files, timeout=40)
+                  payload = resp.json()
+                  if payload.get("status") != "success":
+                      err = payload.get("error", {}).get("error_message", "unknown")
+                      return {"provider": "AudD", "status": "error", "reason": err}
+                  if not payload.get("result"):
+                      return {"provider": "AudD", "status": "no_match"}
+                  r = payload["result"]
+                  platforms = []
+                  if r.get("spotify", {}).get("external_urls", {}).get("spotify"):
+                      platforms.append(f"🎧 Spotify: {r['spotify']['external_urls']['spotify']}")
+                  if r.get("apple_music", {}).get("url"):
+                      platforms.append(f"🍎 Apple Music: {r['apple_music']['url']}")
+                  if r.get("deezer", {}).get("link"):
+                      platforms.append(f"🎵 Deezer: {r['deezer']['link']}")
+                  return {
+                      "provider": "AudD",
+                      "status": "matched",
+                      "title": r.get("title", "N/A"),
+                      "artist": r.get("artist", "N/A"),
+                      "album": r.get("album"),
+                      "release_date": r.get("release_date"),
+                      "label": r.get("label"),
+                      "platforms": platforms,
+                  }
+              except Exception as e:
+                  return {"provider": "AudD", "status": "error", "reason": str(e)}
+
+          results = [acrcloud_lookup(), audd_lookup()]
+          print(results)
+
+          matches = [r for r in results if r["status"] == "matched"]
+          no_matches = [r for r in results if r["status"] == "no_match"]
+          errors = [r for r in results if r["status"] == "error"]
+          skipped = [r for r in results if r["status"] == "skipped"]
+
+          if matches:
+              lines = ["⚠️ ম্যাচ পাওয়া গেছে — গানটি সম্ভবত ইতিমধ্যে distributed:\n"]
+              for m in matches:
+                  lines.append(f"[{m['provider']}]")
+                  lines.append(f"🎵 Title: {m.get('title', 'N/A')}")
+                  lines.append(f"🎤 Artist: {m.get('artist', 'N/A')}")
+                  if m.get("album"):
+                      lines.append(f"💿 Album: {m['album']}")
+                  if m.get("release_date"):
+                      lines.append(f"📅 Release: {m['release_date']}")
+                  if m.get("label"):
+                      lines.append(f"🏷️ Label: {m['label']}")
+                  for p in m.get("platforms", []):
+                      lines.append(p)
+                  lines.append("")
+              if errors or skipped:
+                  lines.append("ℹ️ কিছু provider এই রান-এ কাজ করেনি, তাই রিপোর্ট best-effort.")
+              send_message("\n".join(lines).strip())
+          elif no_matches:
+              msg = (
+                  "✅ কোনো ম্যাচ পাওয়া যায়নি (ACRCloud/AudD best-effort check)।\n\n"
+                  "⚠️ কোনো সিস্টেমই 100% guarantee দিতে পারে না; তবে এখন দুইটা provider দিয়ে coverage বাড়ানো হয়েছে।"
               )
-          else:
-              r = result["result"]
-              msg = "⚠️ ম্যাচ পাওয়া গেছে — এই গানটা ইতিমধ্যে distributed:\n\n"
-              msg += f"🎵 Title: {r.get('title', 'N/A')}\n"
-              msg += f"🎤 Artist: {r.get('artist', 'N/A')}\n"
-              if r.get("album"):
-                  msg += f"💿 Album: {r['album']}\n"
-              if r.get("release_date"):
-                  msg += f"📅 Release: {r['release_date']}\n"
-              if r.get("label"):
-                  msg += f"🏷️ Label: {r['label']}\n"
-
-              platforms = []
-              if r.get("spotify", {}).get("external_urls", {}).get("spotify"):
-                  platforms.append(f"🎧 Spotify: {r['spotify']['external_urls']['spotify']}")
-              if r.get("apple_music", {}).get("url"):
-                  platforms.append(f"🍎 Apple Music: {r['apple_music']['url']}")
-              if r.get("deezer", {}).get("link"):
-                  platforms.append(f"🎵 Deezer: {r['deezer']['link']}")
-
-              if platforms:
-                  msg += "\n📍 যে যে platform-এ পাওয়া গেছে:\n" + "\n".join(platforms)
-              else:
-                  msg += "\n📍 কোনো specific platform link পাওয়া যায়নি, তবে ম্যাচ আছে।"
-
+              if errors or skipped:
+                  msg += "\n\nℹ️ কিছু provider এই রান-এ কাজ করেনি, তাই confidence কমে যেতে পারে।"
               send_message(msg)
+          else:
+              detail = "; ".join([f"{r['provider']}: {r.get('reason', 'unknown')}" for r in errors + skipped]) or "unknown"
+              send_message(f"চেক করতে সমস্যা হয়েছে: {detail}")
           PYEOF
 
       - name: Notify on failure
