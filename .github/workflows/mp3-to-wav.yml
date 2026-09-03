@@ -6,6 +6,7 @@ on:
 jobs:
   convert:
     runs-on: ubuntu-latest
+    permissions: {}
     steps:
       - name: Install ffmpeg
         run: sudo apt-get update -qq && sudo apt-get install -y ffmpeg
